@@ -1,7 +1,7 @@
 """
 Falcon → Progeny HTTP client.
 
-Sends EventPayloads to POST /ingest, receives TurnResponse or AckResponse.
+Sends TickPackages to POST /ingest, receives TurnResponse or AckResponse.
 This is Falcon's only interface to Progeny — it does not know Progeny's internals.
 """
 from __future__ import annotations
@@ -11,7 +11,7 @@ from typing import Optional, Union
 
 import httpx
 
-from shared.schemas import EventPayload, TurnResponse, AckResponse
+from shared.schemas import TickPackage, TurnResponse, AckResponse
 from shared.config import settings
 
 logger = logging.getLogger(__name__)
@@ -31,15 +31,15 @@ async def get_client() -> httpx.AsyncClient:
     return _client
 
 
-async def send_to_progeny(
-    payload: EventPayload,
+async def send_package(
+    package: TickPackage,
 ) -> Optional[Union[TurnResponse, AckResponse]]:
     """
-    Send an EventPayload to Progeny's /ingest endpoint.
+    Send a TickPackage to Progeny's /ingest endpoint.
 
     Returns:
-        TurnResponse for turn triggers
-        AckResponse for data events
+        TurnResponse when package.has_turn_trigger is True
+        AckResponse for data-only packages
         None on failure (graceful degradation — Falcon returns empty to SKSE)
     """
     client = await get_client()
@@ -47,12 +47,12 @@ async def send_to_progeny(
     try:
         response = await client.post(
             "/ingest",
-            json=payload.model_dump(mode="json"),
+            json=package.model_dump(mode="json"),
         )
         response.raise_for_status()
         data = response.json()
 
-        if payload.is_turn_trigger:
+        if package.has_turn_trigger:
             return TurnResponse.model_validate(data)
         return AckResponse.model_validate(data)
 

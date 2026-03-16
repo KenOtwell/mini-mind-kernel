@@ -1,22 +1,20 @@
 """
 Test data factories for the Many-Mind Kernel.
 
-Each factory returns a realistic SKSE wire-format string or EventPayload
-for a specific scenario. Used by both wire_protocol and round-trip tests.
+Each factory returns a realistic SKSE wire-format string, TypedEvent, or
+TickPackage for a specific scenario. Used by wire_protocol and round-trip tests.
 """
 from __future__ import annotations
 
-from uuid import uuid4
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from shared.schemas import (
-    EventPayload, GameEvent, EmotionalState, AgentMemoryContext,
-    MemorySummary, LoreHit, NpcMetadata, ActorValues,
-    PlayerState, WorldState, CompressionTier,
+    TypedEvent, TickPackage,
+    NpcMetadata, ActorValues,
     TurnResponse, AgentResponse, ActorValueDeltas, ActionCommand,
     ExtractionLevel,
 )
-from shared.constants import ZERO_SEMAGRAM
 
 
 # ---------------------------------------------------------------------------
@@ -62,137 +60,94 @@ WIRE_DATA_WITH_PIPES = "info|1710624015|54335.0|Lydia says|she wants|to help"
 
 
 # ---------------------------------------------------------------------------
-# EventPayload factories
+# TypedEvent factories
 # ---------------------------------------------------------------------------
 
-def make_turn_payload(
-    input_text: str = "What do you think about the civil war?",
-    npcs: dict[str, NpcMetadata] | None = None,
+def make_inputtext_event(
+    text: str = "What do you think about the civil war?",
     game_ts: float = 54321.0,
-) -> EventPayload:
-    """Create a turn-trigger EventPayload (player typed something)."""
-    if npcs is None:
-        npcs = {"Lydia": _lydia_metadata()}
-    return EventPayload(
-        event_id=uuid4(),
-        timestamp=datetime.now(timezone.utc),
+) -> TypedEvent:
+    """Create an inputtext TypedEvent (turn trigger)."""
+    return TypedEvent(
+        event_type="inputtext",
+        local_ts=datetime.now(timezone.utc).isoformat(),
         game_ts=game_ts,
-        event=GameEvent(type="inputtext", raw_data=input_text, source_agent="Player"),
+        raw_data=text,
+        parsed_data=None,
         is_turn_trigger=True,
-        emotional_state={
-            "Lydia": EmotionalState(
-                base_vector=[0.1, 0.6, 0.2, 0.0, 0.3, 0.0, 0.1, 0.7, 0.4],
-                delta=[0.0, 0.1, 0.0, 0.0, 0.05, 0.0, 0.0, -0.1, 0.02],
-                curvature=0.15,
-                snap=0.03,
-            ),
-        },
-        memory_context={
-            "Lydia": AgentMemoryContext(
-                retrieved_keys=["point-001", "point-002"],
-                summaries=[
-                    MemorySummary(text="Defended at Western Watchtower.", tier=CompressionTier.MOD, arc_id="arc-001"),
-                ],
-                lore_hits=[
-                    LoreHit(topic="Civil War", content="The conflict between Imperial Legion and Stormcloaks..."),
-                ],
-            ),
-        },
-        npc_metadata=npcs,
-        player=PlayerState(position=[101.0, 200.5, 50.0], cell="WhiterunExterior", input_text=input_text),
-        world_state=WorldState(weather="clear", time_of_day=14.5),
-        urgency=0.15,
     )
 
 
-def make_data_payload(
+def make_info_event(
+    data: str = "Lydia drew her weapon",
+    game_ts: float = 54322.0,
+) -> TypedEvent:
+    """Create an info TypedEvent (non-turn data event)."""
+    return TypedEvent(
+        event_type="info",
+        local_ts=datetime.now(timezone.utc).isoformat(),
+        game_ts=game_ts,
+        raw_data=data,
+        parsed_data=None,
+        is_turn_trigger=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# TickPackage factories
+# ---------------------------------------------------------------------------
+
+def make_turn_package(
+    input_text: str = "What do you think about the civil war?",
+    active_npc_ids: list[str] | None = None,
+    game_ts: float = 54321.0,
+) -> TickPackage:
+    """Create a TickPackage with a turn trigger (player typed something)."""
+    if active_npc_ids is None:
+        active_npc_ids = ["Lydia"]
+    event = make_inputtext_event(input_text, game_ts)
+    return TickPackage(
+        events=[event],
+        has_turn_trigger=True,
+        active_npc_ids=active_npc_ids,
+        tick_interval_ms=2000,
+    )
+
+
+def make_data_package(
     event_type: str = "info",
     data: str = "Lydia drew her weapon",
     game_ts: float = 54322.0,
-) -> EventPayload:
-    """Create a non-turn data event payload."""
-    return EventPayload(
-        event_id=uuid4(),
-        timestamp=datetime.now(timezone.utc),
+) -> TickPackage:
+    """Create a data-only TickPackage (no turn trigger)."""
+    event = TypedEvent(
+        event_type=event_type,
+        local_ts=datetime.now(timezone.utc).isoformat(),
         game_ts=game_ts,
-        event=GameEvent(type=event_type, raw_data=data),
+        raw_data=data,
+        parsed_data=None,
         is_turn_trigger=False,
-        player=PlayerState(position=[101.0, 200.5, 50.0], cell="WhiterunExterior"),
-        world_state=WorldState(),
+    )
+    return TickPackage(
+        events=[event],
+        has_turn_trigger=False,
+        active_npc_ids=[],
+        tick_interval_ms=2000,
     )
 
 
-def make_multi_npc_payload() -> EventPayload:
-    """Create a turn payload with multiple NPCs (Whiterun market walk)."""
-    return make_turn_payload(
+def make_multi_npc_package() -> TickPackage:
+    """Create a turn TickPackage with multiple NPCs (Whiterun market walk)."""
+    return make_turn_package(
         input_text="Hello everyone!",
-        npcs={
-            "Lydia": _lydia_metadata(),
-            "Belethor": NpcMetadata(
-                position=[105.0, 210.0, 50.0], cell="WhiterunExterior",
-                actor_values=ActorValues(Aggression=0, Confidence=1, Mood=3),
-            ),
-            "Ysolda": NpcMetadata(
-                position=[108.0, 205.0, 50.0], cell="WhiterunExterior",
-                actor_values=ActorValues(Confidence=2, Mood=3),
-            ),
-            "Heimskr": NpcMetadata(
-                position=[120.0, 215.0, 50.0], cell="WhiterunExterior",
-                actor_values=ActorValues(Mood=1),
-            ),
-        },
+        active_npc_ids=["Lydia", "Belethor", "Ysolda", "Heimskr"],
     )
 
 
-def make_combat_payload() -> EventPayload:
-    """Create a high-urgency combat scenario."""
-    return EventPayload(
-        event_id=uuid4(),
-        timestamp=datetime.now(timezone.utc),
-        game_ts=60000.0,
-        event=GameEvent(type="inputtext", raw_data="Watch out!", source_agent="Player"),
-        is_turn_trigger=True,
-        emotional_state={
-            "Lydia": EmotionalState(
-                base_vector=[0.8, 0.9, 0.1, 0.0, 0.7, 0.0, 0.0, 0.2, 0.6],
-                delta=[0.3, 0.4, 0.0, 0.0, 0.3, 0.0, 0.0, -0.3, 0.1],
-                curvature=0.85,
-                snap=0.72,
-            ),
-        },
-        npc_metadata={"Lydia": _lydia_metadata()},
-        player=PlayerState(position=[50.0, 50.0, 10.0], cell="BleakFallsBarrow01", input_text="Watch out!"),
-        world_state=WorldState(weather="clear", time_of_day=22.0),
-        urgency=0.72,
-    )
-
-
-def make_quest_scene_payload() -> EventPayload:
-    """Create a payload where an NPC is in a scripted quest scene."""
-    return make_turn_payload(
-        input_text="Lydia, what's going on?",
-        npcs={
-            "Lydia": NpcMetadata(
-                position=[100.0, 200.0, 50.0], cell="WhiterunDragonsreach",
-                in_scene=True,  # Quest-collision guard should activate
-                is_follower=True,
-                actor_values=ActorValues(Confidence=3, Mood=0),
-            ),
-        },
-    )
-
-
-def make_cell_transition_payload() -> EventPayload:
-    """Create a cell transition event (entering a new area)."""
-    return EventPayload(
-        event_id=uuid4(),
-        timestamp=datetime.now(timezone.utc),
-        game_ts=70000.0,
-        event=GameEvent(type="location", raw_data="WhiterunDragonsreach"),
-        is_turn_trigger=False,
-        player=PlayerState(position=[0.0, 0.0, 0.0], cell="WhiterunDragonsreach"),
-        world_state=WorldState(cell_transition=True, reset=True),
-    )
+# Backward-compat aliases
+make_turn_payload = make_turn_package
+make_data_payload = make_data_package
+make_multi_npc_payload = make_multi_npc_package
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +157,7 @@ def make_cell_transition_payload() -> EventPayload:
 def make_lydia_response() -> TurnResponse:
     """Expected stub response for Lydia."""
     return TurnResponse(
-        event_id=uuid4(),  # Will be overridden in tests
+        tick_id=uuid4(),
         responses=[
             AgentResponse(
                 agent_id="Lydia",
@@ -240,6 +195,7 @@ EXPECTED_WIRE_MULTI_NPC = (
 # ---------------------------------------------------------------------------
 
 def _lydia_metadata() -> NpcMetadata:
+    """NpcMetadata for Lydia — kept for potential direct use in tests."""
     return NpcMetadata(
         position=[100.5, 200.3, 50.0],
         cell="WhiterunExterior",

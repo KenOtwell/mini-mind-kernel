@@ -4,6 +4,13 @@ Canonical data schemas for the Many-Mind Kernel.
 THE CONTRACT — shared types between Falcon and Progeny.
 Both services import from here. If it's not in this file,
 it's not part of the interface.
+
+Wire flow:
+  SKSE → Falcon → TickPackage → Progeny → TurnResponse | AckResponse → Falcon → SKSE
+
+Falcon decodes structure (event_parsers.py) and ships typed TickPackages.
+Progeny owns ALL semantic interpretation, embedding, emotional computation,
+memory retrieval, LLM interaction, and ALL Qdrant writes.
 """
 from __future__ import annotations
 
@@ -20,25 +27,91 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 class EventType(str, Enum):
-    """SKSE event types from the wire protocol."""
+    """
+    SKSE event types from the wire protocol.
+
+    See living doc §SKSE Wire Protocol for the full taxonomy with per-type
+    data field formats. Several types are prefix-matched in HerikaServer
+    (e.g. any type starting with "info" or "addnpc"); Falcon preserves the
+    lowercased type verbatim and Progeny handles prefix semantics.
+    """
+    # --- Turn triggers (Progeny detects these in incoming TickPackage) ---
     INPUTTEXT = "inputtext"
     INPUTTEXT_S = "inputtext_s"
+
+    # --- Response polling (Falcon-local, never reaches Progeny) ---
+    REQUEST = "request"
+
+    # --- Dialogue / speech context ---
+    SPEECH = "_speech"
+    CHAT = "chat"
+    CHATNF = "chatnf"
+    JUST_SAY = "just_say"
+    FUNCRET = "funcret"
+
+    # --- Session lifecycle ---
+    INIT = "init"
+    WIPE = "wipe"
+    PLAYERDIED = "playerdied"
+    GOODNIGHT = "goodnight"
+    WAITSTART = "waitstart"
+    WAITSTOP = "waitstop"
+
+    # --- NPC registration and live stats ---
+    ADDNPC = "addnpc"
+    UPDATESTATS = "updatestats"
+    ITEMTRANSFER = "itemtransfer"
+    ENABLE_BG = "enable_bg"
+    SWITCHRACE = "switchrace"
+
+    # --- Quest events ---
+    QUEST = "quest"
+    QUEST_JSON = "_quest"
+    UQUEST = "_uquest"
+    QUESTDATA = "_questdata"
+    QUESTRESET = "_questreset"
+
+    # --- Info / world events (info* prefix in HerikaServer) ---
     INFO = "info"
     INFONPC = "infonpc"
     INFOLOC = "infoloc"
+    INFOSAVE = "infosave"
     LOCATION = "location"
-    CHAT = "chat"
     DEATH = "death"
-    DIARY = "diary"
-    QUEST = "quest"
-    QUEST_JSON = "_quest"
     BOOK = "book"
-    REQUEST = "request"
-    FUNCRET = "funcret"
-    GOODNIGHT = "goodnight"
-    SPEECH = "_speech"
+    CONTENTBOOK = "contentbook"
+
+    # --- Diary ---
+    DIARY = "diary"
+    DIARY_NEARBY = "diary_nearby"
+
+    # --- World data utilities (bulk /‑delimited topology loads) ---
+    UTIL_LOCATION_NAME = "util_location_name"
+    UTIL_FACTION_NAME = "util_faction_name"
+    UTIL_LOCATION_NPC = "util_location_npc"
+    NAMED_CELL = "named_cell"
+    NAMED_CELL_STATIC = "named_cell_static"
+
+    # --- Task management ---
     FORCE_CURRENT_TASK = "force_current_task"
-    CHATNF = "chatnf"
+    RECOVER_LAST_TASK = "recover_last_task"
+
+    # --- Configuration / admin ---
+    SETCONF = "setconf"
+    TOGGLEMODEL = "togglemodel"
+
+    # --- Dynamic profiles ---
+    UPDATEPROFILE = "updateprofile"
+    UPDATEPROFILES_BATCH_ASYNC = "updateprofiles_batch_async"
+    CORE_PROFILE_ASSIGN = "core_profile_assign"
+
+    # --- SNQE (Synthetic Narrative Quest Engine) ---
+    SNQE = "snqe"
+
+    # --- Deprecated (log + ignore) ---
+    UPDATEEQUIPMENT = "updateequipment"
+    UPDATEINVENTORY = "updateinventory"
+    UPDATESKILLS = "updateskills"
 
 
 class CompressionTier(str, Enum):
@@ -65,18 +138,137 @@ class PrivacyLevel(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# Sub-models
+# Structurally decoded event data models — output of event_parsers.py
 # ---------------------------------------------------------------------------
 
-class GameEvent(BaseModel):
-    """A single game event parsed from SKSE wire format."""
-    type: str  # Kept as str for flexibility with unknown event types
-    raw_data: str
-    source_agent: Optional[str] = None
+class SpeechData(BaseModel):
+    """
+    Decoded _speech event data. JSON payload from SKSE.
 
+    companions[] contains names of nearby NPCs — used by Progeny for
+    Many-Mind scheduling (Chorus tier candidates).
+    """
+    listener: str
+    speaker: str
+    speech: str
+    location: str
+    companions: list[str] = Field(default_factory=list)
+    distance: float = 0.0
+
+
+class NpcRegistration(BaseModel):
+    """
+    Decoded addnpc event data. @-delimited, 43+ fields.
+
+    Sent when an NPC enters loaded cells. Contains skills (18), equipment
+    (10 slots), stats (8), mods, factions, and class info.
+    """
+    name: str
+    base: str = ""
+    gender: str = ""
+    race: str = ""
+    refid: str = ""
+    skills: dict[str, str] = Field(default_factory=dict)
+    equipment: dict[str, str] = Field(default_factory=dict)
+    stats: dict[str, float] = Field(default_factory=dict)
+    mods: list[str] = Field(default_factory=list)
+    factions: list[dict] = Field(default_factory=list)
+    class_info: Optional[dict] = None
+
+
+class NpcStats(BaseModel):
+    """
+    Decoded updatestats event data. @-delimited.
+
+    Sent every ~3 seconds in combat or on hit.
+    """
+    npc_name: str
+    level: int = 1
+    health: float = 0.0
+    health_max: float = 0.0
+    magicka: float = 0.0
+    magicka_max: float = 0.0
+    stamina: float = 0.0
+    stamina_max: float = 0.0
+    scale: float = 1.0
+
+
+class QuestData(BaseModel):
+    """Decoded _quest event data. JSON payload."""
+    form_id: str
+    name: str = ""
+    brief: str = ""
+    stage: str = ""
+    giver: str = ""
+    status: str = ""
+
+
+class QuestUpdate(BaseModel):
+    """Decoded _uquest / _questdata event data. @-delimited."""
+    form_id: str
+    briefing: str = ""
+    stage: str = ""
+
+
+class ItemTransfer(BaseModel):
+    """Decoded itemtransfer event data. Natural-language, regex-parsed."""
+    source: str
+    dest: str
+    item_name: str
+    count: int = 1
+
+
+# ---------------------------------------------------------------------------
+# Falcon → Progeny wire contract: TypedEvent and TickPackage
+# ---------------------------------------------------------------------------
+
+class TypedEvent(BaseModel):
+    """
+    A single SKSE event, structurally decoded by Falcon.
+
+    raw_data is the verbatim data field from the wire. parsed_data is the
+    structurally decoded form based on event_type (populated by
+    event_parsers.py for known types; None for unrecognised types).
+    Progeny does all semantic interpretation — Falcon only decodes structure.
+    """
+    event_type: str          # Lowercased verbatim from wire
+    local_ts: str
+    game_ts: float
+    raw_data: str
+    parsed_data: Optional[dict] = None   # Type-specific structural decode
+    is_turn_trigger: bool = False
+
+
+class TickPackage(BaseModel):
+    """
+    Falcon → Progeny: one tick window of typed SKSE events.
+
+    Falcon ships this on its tick cadence (~1-3 seconds, configurable).
+    Contains every SKSE event accumulated since the last tick, in arrival
+    order. Progeny detects turn boundaries by scanning for inputtext /
+    inputtext_s events. has_turn_trigger is a convenience boolean —
+    Progeny should verify by scanning events.
+
+    active_npc_ids is populated from Falcon's addnpc-derived NPC registry
+    (the set of NPCs currently in loaded cells).
+    """
+    tick_id: UUID = Field(default_factory=uuid4)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    events: list[TypedEvent] = Field(default_factory=list)
+    has_turn_trigger: bool = False
+    tick_interval_ms: int = 0
+    active_npc_ids: list[str] = Field(
+        default_factory=list,
+        description="NPC IDs currently in loaded cells, from accumulated addnpc events.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cognitive / context sub-models — used internally by Progeny
+# ---------------------------------------------------------------------------
 
 class EmotionalState(BaseModel):
-    """Per-agent emotional state, computed by Falcon."""
+    """Per-agent emotional state snapshot, computed by Progeny."""
     base_vector: list[float] = Field(..., min_length=9, max_length=9,
                                      description="Current 9d semagram")
     delta: list[float] = Field(..., min_length=9, max_length=9,
@@ -146,36 +338,8 @@ class WorldState(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Top-level payloads — THE CONTRACT
+# LLM response models — Progeny → Falcon contract
 # ---------------------------------------------------------------------------
-
-class EventPayload(BaseModel):
-    """
-    Falcon → Progeny: per-event payload.
-
-    Sent to POST /ingest on every SKSE event (except Falcon-local ones).
-    Turn triggers include memory_context; data events do not.
-    """
-    event_id: UUID = Field(default_factory=uuid4)
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    game_ts: float
-
-    event: GameEvent
-    is_turn_trigger: bool
-
-    emotional_state: dict[str, EmotionalState] = Field(
-        default_factory=dict,
-        description="Keyed by agent_id. Only affected agents included.")
-    memory_context: Optional[dict[str, AgentMemoryContext]] = Field(
-        None,
-        description="Only present when is_turn_trigger == true")
-    npc_metadata: dict[str, NpcMetadata] = Field(
-        default_factory=dict,
-        description="All NPCs in loaded cells")
-    player: PlayerState = Field(default_factory=PlayerState)
-    world_state: WorldState = Field(default_factory=WorldState)
-    urgency: float = Field(0.0, description="Max snap across active agents")
-
 
 class ActionCommand(BaseModel):
     """A single action from the 43-command vocabulary."""
@@ -194,7 +358,7 @@ class ActorValueDeltas(BaseModel):
 
 
 class UpdatedHarmonics(BaseModel):
-    """LLM-proposed emotional state update."""
+    """LLM-proposed emotional state update (proposed by LLM, validated by Progeny)."""
     base_vector: list[float] = Field(..., min_length=9, max_length=9)
 
 
@@ -216,11 +380,13 @@ class AgentResponse(BaseModel):
 
 class TurnResponse(BaseModel):
     """
-    Progeny → Falcon: per-turn response.
+    Progeny → Falcon: per-turn response bundle.
 
-    Returned synchronously as HTTP response body to a turn-trigger EventPayload.
+    Returned as the HTTP response body when the TickPackage contained
+    a turn trigger (inputtext / inputtext_s). tick_id echoes the
+    TickPackage.tick_id for correlation.
     """
-    event_id: UUID
+    tick_id: UUID
     turn_id: UUID = Field(default_factory=uuid4)
     responses: list[AgentResponse] = Field(default_factory=list)
     processing_time_ms: int = 0
@@ -229,9 +395,10 @@ class TurnResponse(BaseModel):
 
 class AckResponse(BaseModel):
     """
-    Progeny → Falcon: ack for non-turn events.
+    Progeny → Falcon: ack for data-only tick packages.
 
-    Returned immediately — Progeny accumulated the event.
+    Returned immediately — Progeny accumulated the events.
+    tick_id echoes the TickPackage.tick_id for correlation.
     """
-    event_id: UUID
+    tick_id: UUID
     status: str = "accumulated"

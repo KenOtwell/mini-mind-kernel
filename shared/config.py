@@ -44,6 +44,10 @@ class FalconConfig:
     host: str = field(default_factory=lambda: _env("FALCON_HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: _env_int("FALCON_PORT", 8000))
     comm_path: str = field(default_factory=lambda: _env("FALCON_COMM_PATH", "/comm.php"))
+    # Tick cadence: Falcon ships an event package to Progeny every N seconds.
+    tick_interval_seconds: float = field(
+        default_factory=lambda: _env_float("FALCON_TICK_INTERVAL", 2.0)
+    )
 
 
 @dataclass
@@ -61,7 +65,7 @@ class ProgenyConfig:
 
 @dataclass
 class EmbeddingConfig:
-    """Embedding model settings (Falcon only, CPU)."""
+    """Embedding model settings (Progeny, CPU on Beelink). Not used by Falcon."""
     model_name: str = "all-MiniLM-L6-v2"
     device: str = "cpu"
     semantic_dim: int = 384

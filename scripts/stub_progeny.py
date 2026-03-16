@@ -13,7 +13,7 @@ from uuid import uuid4
 from fastapi import FastAPI
 
 from shared.schemas import (
-    EventPayload, TurnResponse, AckResponse,
+    TickPackage, TurnResponse, AckResponse,
     AgentResponse, ActorValueDeltas, ActionCommand,
     ExtractionLevel,
 )
@@ -78,25 +78,25 @@ def _canned(agent_id: str) -> AgentResponse:
 # ---------------------------------------------------------------------------
 
 @app.post("/ingest")
-async def ingest(payload: EventPayload) -> TurnResponse | AckResponse:
+async def ingest(package: TickPackage) -> TurnResponse | AckResponse:
     """Mock Progeny ingest — accumulate or return canned turn response."""
-    if not payload.is_turn_trigger:
-        logger.info("Accumulated %s event (game_ts=%.1f)", payload.event.type, payload.game_ts)
-        return AckResponse(event_id=payload.event_id)
+    if not package.has_turn_trigger:
+        logger.info("Accumulated tick (%d events)", len(package.events))
+        return AckResponse(tick_id=package.tick_id)
 
     start = time.monotonic()
-    npc_count = len(payload.npc_metadata)
-    logger.info("Turn trigger: %d NPCs, input='%s'",
-                npc_count, (payload.player.input_text or "")[:60])
+    logger.info("Turn trigger: %d NPCs, %d events",
+                len(package.active_npc_ids), len(package.events))
 
-    # Build canned responses for each NPC in the metadata
-    responses = [_canned(agent_id) for agent_id in payload.npc_metadata]
+    # Build canned responses for each active NPC; fall back if registry is empty
+    npc_ids = package.active_npc_ids or ["Unknown"]
+    responses = [_canned(npc_id) for npc_id in npc_ids]
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
     logger.info("Returning %d canned responses (%dms)", len(responses), elapsed_ms)
 
     return TurnResponse(
-        event_id=payload.event_id,
+        tick_id=package.tick_id,
         turn_id=uuid4(),
         responses=responses,
         processing_time_ms=elapsed_ms,

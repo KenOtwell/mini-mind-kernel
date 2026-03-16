@@ -11,11 +11,11 @@ from httpx import AsyncClient, ASGITransport
 
 from falcon.api.server import app as falcon_app
 from scripts.stub_progeny import app as stub_app
-from shared.schemas import TurnResponse, AckResponse, AgentResponse, ExtractionLevel
+from shared.schemas import TickPackage, TurnResponse, AckResponse, AgentResponse, ExtractionLevel
 from tests.fixtures.factories import (
     WIRE_INPUTTEXT, WIRE_INFO, WIRE_REQUEST, WIRE_GOODNIGHT, WIRE_CHATNF,
     WIRE_MALFORMED_EMPTY, WIRE_DATA_WITH_PIPES,
-    make_turn_payload,
+    make_turn_package,
 )
 
 
@@ -87,6 +87,8 @@ class TestFalconEndpoint:
             data = resp.json()
             assert data["service"] == "falcon"
             assert "queue_depth" in data
+            assert "active_npcs" in data
+            assert "tick_interval_s" in data
 
 
 # ---------------------------------------------------------------------------
@@ -99,12 +101,12 @@ class TestStubProgeny:
     @pytest.mark.anyio
     async def test_turn_trigger_returns_responses(self):
         """Stub should return canned responses for turn triggers."""
-        payload = make_turn_payload()
+        package = make_turn_package()
         async with AsyncClient(
             transport=ASGITransport(app=stub_app),
             base_url="http://test",
         ) as client:
-            resp = await client.post("/ingest", json=payload.model_dump(mode="json"))
+            resp = await client.post("/ingest", json=package.model_dump(mode="json"))
             assert resp.status_code == 200
             data = resp.json()
             turn = TurnResponse.model_validate(data)
@@ -116,13 +118,13 @@ class TestStubProgeny:
     @pytest.mark.anyio
     async def test_data_event_returns_ack(self):
         """Stub should return AckResponse for non-turn events."""
-        from tests.fixtures.factories import make_data_payload
-        payload = make_data_payload()
+        from tests.fixtures.factories import make_data_package
+        package = make_data_package()
         async with AsyncClient(
             transport=ASGITransport(app=stub_app),
             base_url="http://test",
         ) as client:
-            resp = await client.post("/ingest", json=payload.model_dump(mode="json"))
+            resp = await client.post("/ingest", json=package.model_dump(mode="json"))
             assert resp.status_code == 200
             ack = AckResponse.model_validate(resp.json())
             assert ack.status == "accumulated"
@@ -130,13 +132,13 @@ class TestStubProgeny:
     @pytest.mark.anyio
     async def test_multi_npc_returns_all(self):
         """Stub should return one response per NPC."""
-        from tests.fixtures.factories import make_multi_npc_payload
-        payload = make_multi_npc_payload()
+        from tests.fixtures.factories import make_multi_npc_package
+        package = make_multi_npc_package()
         async with AsyncClient(
             transport=ASGITransport(app=stub_app),
             base_url="http://test",
         ) as client:
-            resp = await client.post("/ingest", json=payload.model_dump(mode="json"))
+            resp = await client.post("/ingest", json=package.model_dump(mode="json"))
             turn = TurnResponse.model_validate(resp.json())
             agent_ids = {r.agent_id for r in turn.responses}
             assert "Lydia" in agent_ids
@@ -161,14 +163,14 @@ class TestStubProgeny:
 class TestSchemaValidation:
     """Test that Pydantic models validate correctly."""
 
-    def test_event_payload_serializes(self):
-        """EventPayload should round-trip through JSON."""
-        payload = make_turn_payload()
-        json_data = payload.model_dump(mode="json")
-        restored = type(payload).model_validate(json_data)
-        assert restored.event.type == "inputtext"
-        assert restored.is_turn_trigger is True
-        assert len(restored.emotional_state) == 1
+    def test_tick_package_serializes(self):
+        """TickPackage should round-trip through JSON."""
+        package = make_turn_package()
+        json_data = package.model_dump(mode="json")
+        restored = TickPackage.model_validate(json_data)
+        assert restored.events[0].event_type == "inputtext"
+        assert restored.has_turn_trigger is True
+        assert len(restored.active_npc_ids) == 1
 
     def test_actor_value_clamping(self):
         """Actor values outside range should fail validation."""

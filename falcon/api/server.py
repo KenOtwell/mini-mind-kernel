@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from falcon.api.routes import router
+from falcon.api.routes import router, startup as routes_startup, shutdown as routes_shutdown
 from falcon.src.progeny_protocol import close as close_progeny_client
 from shared.config import settings
 
@@ -28,9 +28,11 @@ async def lifespan(app: FastAPI):
     logger.info("Falcon starting — listening on %s:%d%s",
                 settings.falcon.host, settings.falcon.port, settings.falcon.comm_path)
     logger.info("Progeny endpoint: %s/ingest", settings.progeny.base_url)
+    await routes_startup()
     # TODO: Initialize embedding model (all-MiniLM-L6-v2, CPU)
     # TODO: Initialize Qdrant client (localhost:6333)
     yield
+    await routes_shutdown()
     await close_progeny_client()
     logger.info("Falcon shut down")
 

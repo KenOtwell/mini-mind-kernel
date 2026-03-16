@@ -46,14 +46,42 @@ ACTOR_VALUE_RANGES: dict[str, tuple[int, int, str]] = {
 # SKSE Event Types
 # ---------------------------------------------------------------------------
 
-# Events that trigger an LLM call via Progeny
+# Turn triggers — fall through pre-processor to LLM in HerikaServer;
+# in MMK, Progeny detects these in the incoming TickPackage.
 TURN_TRIGGER_TYPES: frozenset[str] = frozenset({"inputtext", "inputtext_s"})
 
-# Events handled locally by Falcon — NOT forwarded to Progeny
-FALCON_LOCAL_TYPES: frozenset[str] = frozenset({"request", "chatnf"})
+# Events handled locally by Falcon — never accumulated or forwarded to Progeny.
+# request  : SKSE polls for queued responses — dequeue from local response queue.
+# chatnf   : Chat target not found — log and return empty.
+# just_say : Direct output passthrough — queue data text directly for SKSE.
+FALCON_LOCAL_TYPES: frozenset[str] = frozenset({"request", "chatnf", "just_say"})
 
-# Session lifecycle events
-SESSION_TYPES: frozenset[str] = frozenset({"goodnight"})
+# Session lifecycle events (carry session semantics; forwarded to Progeny in tick).
+# init / wipe also trigger an NPC registry clear on Falcon.
+SESSION_TYPES: frozenset[str] = frozenset({
+    "init", "wipe", "playerdied", "goodnight", "waitstart", "waitstop",
+})
+
+# NPC registration and live stats events.
+NPC_DATA_TYPES: frozenset[str] = frozenset({
+    "addnpc", "updatestats", "itemtransfer", "enable_bg", "switchrace",
+})
+
+# Quest management events.
+QUEST_TYPES: frozenset[str] = frozenset({
+    "_quest", "_uquest", "_questdata", "_questreset", "quest",
+})
+
+# World data utility events — bulk /‑delimited topology/location loads.
+WORLD_DATA_TYPES: frozenset[str] = frozenset({
+    "util_location_name", "util_faction_name", "util_location_npc",
+    "named_cell", "named_cell_static",
+})
+
+# NOTE: Several event types in HerikaServer use prefix matching (strpos),
+# e.g. any type starting with "info" or "addnpc". Falcon lowercases the type
+# and ships it verbatim in TypedEvent.event_type; Progeny handles prefix
+# semantics if needed.
 
 
 # ---------------------------------------------------------------------------

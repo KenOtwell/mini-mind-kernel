@@ -11,6 +11,8 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 
+import base64
+
 from fastapi import APIRouter, Request, Response
 
 from falcon.src.wire_protocol import parse_event, format_turn_response
@@ -67,10 +69,11 @@ async def comm_endpoint(request: Request) -> Response:
     """
     SKSE compatibility endpoint.
 
-    Accepts pipe-delimited wire format, returns CHIM wire format.
+    Accepts base64-encoded pipe-delimited wire format in query string
+    (?DATA=<base64>&profile=<name>), returns CHIM wire format.
     This is the entry point that replaces HerikaServer's comm.php.
     """
-    raw_body = (await request.body()).decode("utf-8", errors="replace")
+    raw_body = await _decode_skse_request(request)
     parsed = parse_event(raw_body)
 
     if parsed is None:
@@ -123,6 +126,57 @@ async def comm_endpoint(request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# SKSE request decoding
+# ---------------------------------------------------------------------------
+
+async def _decode_skse_request(request: Request) -> str:
+    """
+    Decode SKSE wire data from the HTTP request.
+
+    The DLL sends data as base64 in the query string:
+        GET/POST ...?DATA=<base64>&profile=<name>
+
+    Falls back to raw POST body for testing and forward compatibility.
+    """
+    # Primary: base64-encoded DATA in query string (what the DLL sends)
+    data_param = request.query_params.get("DATA") or request.query_params.get("data")
+    if data_param:
+        try:
+            decoded = base64.b64decode(data_param).decode("utf-8", errors="replace")
+            logger.debug("Decoded base64 DATA from query string (%d bytes)", len(decoded))
+            return decoded
+        except Exception as exc:
+            logger.warning("Failed to base64-decode DATA param: %s", exc)
+
+    # Fallback: check if the full query string is DATA=<base64> without proper parsing
+    # (some HTTP clients mangle query params with + chars in base64)
+    raw_qs = str(request.url.query)
+    if raw_qs.upper().startswith("DATA="):
+        # Strip "DATA=" prefix, take up to first & if present
+        b64_part = raw_qs[5:]
+        amp_pos = b64_part.find("&")
+        if amp_pos >= 0:
+            b64_part = b64_part[:amp_pos]
+        try:
+            decoded = base64.b64decode(b64_part).decode("utf-8", errors="replace")
+            logger.debug("Decoded base64 from raw query string (%d bytes)", len(decoded))
+            return decoded
+        except Exception as exc:
+            logger.warning("Failed to base64-decode raw query string: %s", exc)
+
+    # Fallback: raw POST body (for testing and forward compatibility)
+    body = (await request.body()).decode("utf-8", errors="replace")
+    if body:
+        logger.debug("Using raw POST body (%d bytes)", len(body))
+    return body
+
+
+def _get_profile(request: Request) -> str:
+    """Extract the CHIM profile name from the request query string."""
+    return request.query_params.get("profile", "")
+
+
+# ---------------------------------------------------------------------------
 # Tick processing
 # ---------------------------------------------------------------------------
 
@@ -132,7 +186,6 @@ async def _process_tick(package: TickPackage) -> None:
         result = await send_package(package)
 
         if result and isinstance(result, TurnResponse) and result.responses:
-            # TODO: Run bidirectional delta on each agent's utterance
             wire_output = format_turn_response(
                 [r.model_dump() for r in result.responses]
             )

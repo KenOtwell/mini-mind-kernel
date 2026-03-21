@@ -29,8 +29,6 @@ async def lifespan(app: FastAPI):
                 settings.falcon.host, settings.falcon.port, settings.falcon.comm_path)
     logger.info("Progeny endpoint: %s/ingest", settings.progeny.base_url)
     await routes_startup()
-    # TODO: Initialize embedding model (all-MiniLM-L6-v2, CPU)
-    # TODO: Initialize Qdrant client (localhost:6333)
     yield
     await routes_shutdown()
     await close_progeny_client()

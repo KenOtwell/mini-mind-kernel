@@ -13,6 +13,11 @@ from falcon.src.event_parsers import (
     parse_quest_json,
     parse_quest_update,
     parse_itemtransfer,
+    parse_location_name,
+    parse_faction_name,
+    parse_location_npc,
+    parse_named_cell,
+    parse_named_cell_static,
     parse_typed_data,
 )
 
@@ -323,3 +328,110 @@ class TestParseTypedData:
     def test_addnpc_malformed_returns_none(self):
         result = parse_typed_data("addnpc", "")
         assert result is None
+
+    def test_location_name_dispatches(self):
+        result = parse_typed_data("util_location_name", "Whiterun/0x123/WhiterunHold/Whiterun/town/0/CompanionsFaction/100.0/200.0")
+        assert result is not None
+        assert result["name"] == "Whiterun"
+        assert result["hold"] == "Whiterun"
+
+    def test_named_cell_dispatches(self):
+        result = parse_typed_data("named_cell", "Breezehome/0x01/0x02/1/0x03/0x04/0x05/Tamriel/0/Front Door/10.0/20.0")
+        assert result is not None
+        assert result["cell_name"] == "Breezehome"
+        assert result["interior"] is True
+
+
+# ---------------------------------------------------------------------------
+# World-state parsers
+# ---------------------------------------------------------------------------
+
+class TestParseLocationName:
+    def test_happy_path(self):
+        result = parse_location_name("Whiterun/0xABC/WhiterunHold/Whiterun/town,marketplace/0/CompFaction/150.5/300.2")
+        assert result is not None
+        assert result["name"] == "Whiterun"
+        assert result["formid"] == "0xABC"
+        assert result["region"] == "WhiterunHold"
+        assert result["hold"] == "Whiterun"
+        assert result["is_interior"] is False
+        assert result["x"] == 150.5
+        assert result["y"] == 300.2
+
+    def test_clear_all_sentinel(self):
+        result = parse_location_name("__CLEAR_ALL__")
+        assert result is not None
+        assert result["clear_all"] is True
+
+    def test_interior_flag(self):
+        result = parse_location_name("Dragonsreach/0x01/Hold/Whiterun/palace/1/Jarl/0/0")
+        assert result is not None
+        assert result["is_interior"] is True
+
+    def test_empty_returns_none(self):
+        assert parse_location_name("") is None
+
+
+class TestParseFactionName:
+    def test_happy_path(self):
+        result = parse_faction_name("0x000A1B2C/Companions")
+        assert result is not None
+        assert result["formid"] == "0x000A1B2C"
+        assert result["name"] == "Companions"
+
+    def test_missing_name_returns_none(self):
+        assert parse_faction_name("0x000A1B2C") is None
+
+
+class TestParseLocationNpc:
+    def test_happy_path(self):
+        result = parse_location_npc("Lydia/100.5/200.3/50.0/guard")
+        assert result is not None
+        assert result["npc_name"] == "Lydia"
+        assert result["x"] == 100.5
+        assert result["y"] == 200.3
+        assert result["z"] == 50.0
+        assert result["tag"] == "guard"
+
+    def test_empty_returns_none(self):
+        assert parse_location_npc("") is None
+
+    def test_partial_uses_defaults(self):
+        result = parse_location_npc("Faendal/10.0")
+        assert result is not None
+        assert result["x"] == 10.0
+        assert result["y"] == 0.0
+        assert result["tag"] == ""
+
+
+class TestParseNamedCell:
+    def test_happy_path(self):
+        result = parse_named_cell("Breezehome/0x01/0x02/1/0x03/0x04/0x05/Tamriel/0/Front Door/10.0/20.0")
+        assert result is not None
+        assert result["cell_name"] == "Breezehome"
+        assert result["interior"] is True
+        assert result["closed"] is False
+        assert result["door_name"] == "Front Door"
+        assert result["door_x"] == 10.0
+
+    def test_empty_returns_none(self):
+        assert parse_named_cell("") is None
+
+
+class TestParseNamedCellStatic:
+    def test_happy_path(self):
+        result = parse_named_cell_static("0xABC/Iron Sword@0x01,Health Potion@0x02")
+        assert result is not None
+        assert result["cell_id"] == "0xABC"
+        assert len(result["items"]) == 2
+        assert result["items"][0]["name"] == "Iron Sword"
+        assert result["items"][1]["refid"] == "0x02"
+
+    def test_empty_items(self):
+        result = parse_named_cell_static("0xABC/")
+        assert result is not None
+        assert result["cell_id"] == "0xABC"
+        assert result["items"] == []
+
+    def test_empty_returns_none(self):
+        assert parse_named_cell_static("") is None

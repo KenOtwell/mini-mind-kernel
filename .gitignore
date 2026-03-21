@@ -30,6 +30,11 @@ Desktop.ini
 # Scaffolding snapshots
 *.7z
 
+# ChIM reference docs (binaries: .dll, .pex, .esp, .tar, .wav)
+# Source analysis only — not our code, not a dependency
+docs/AIAgent/
+docs/Dwemer Distro/
+
 # Logs
 *.log
 

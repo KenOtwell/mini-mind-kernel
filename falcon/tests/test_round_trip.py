@@ -4,6 +4,7 @@ Round-trip integration tests: SKSE event → Falcon → stub Progeny → CHIM wi
 Uses FastAPI TestClient with stub_progeny mounted in-process (no network).
 """
 import asyncio
+import base64
 import pytest
 from unittest.mock import AsyncMock, patch
 
@@ -89,6 +90,43 @@ class TestFalconEndpoint:
             assert "queue_depth" in data
             assert "active_npcs" in data
             assert "tick_interval_s" in data
+
+    @pytest.mark.anyio
+    async def test_base64_query_string_decoding(self):
+        """SKSE DLL sends base64-encoded data in the query string."""
+        wire_data = "request|1710624010|54330.0|"
+        b64_data = base64.b64encode(wire_data.encode()).decode()
+        async with AsyncClient(
+            transport=ASGITransport(app=falcon_app),
+            base_url="http://test",
+        ) as client:
+            resp = await client.post(f"/comm.php?DATA={b64_data}&profile=default")
+            assert resp.status_code == 200
+            assert resp.text == ""  # request poll with empty queue
+
+    @pytest.mark.anyio
+    async def test_base64_session_event(self):
+        """Base64-encoded session events should be handled correctly."""
+        wire_data = "goodnight|1710624012|54332.0|"
+        b64_data = base64.b64encode(wire_data.encode()).decode()
+        async with AsyncClient(
+            transport=ASGITransport(app=falcon_app),
+            base_url="http://test",
+        ) as client:
+            resp = await client.post(f"/comm.php?DATA={b64_data}")
+            assert resp.status_code == 200
+            assert resp.text == ""
+
+    @pytest.mark.anyio
+    async def test_raw_body_fallback_still_works(self):
+        """Existing raw POST body path should still work for testing."""
+        async with AsyncClient(
+            transport=ASGITransport(app=falcon_app),
+            base_url="http://test",
+        ) as client:
+            resp = await client.post("/comm.php", content=WIRE_REQUEST)
+            assert resp.status_code == 200
+            assert resp.text == ""
 
 
 # ---------------------------------------------------------------------------

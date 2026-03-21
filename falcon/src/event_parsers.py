@@ -275,17 +275,151 @@ def parse_itemtransfer(data: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# util_location_name → LocationData
+# ---------------------------------------------------------------------------
+
+def parse_location_name(data: str) -> Optional[dict]:
+    """util_location_name → dict. /-delimited: name/formid/region/hold/tags/is_interior/factions/x/y"""
+    if data.strip() == "__CLEAR_ALL__":
+        return {"clear_all": True}
+    parts = data.split("/")
+    if not parts or not parts[0].strip():
+        return None
+
+    def _get(idx: int) -> str:
+        return parts[idx].strip() if len(parts) > idx else ""
+
+    def _float(idx: int) -> float:
+        try:
+            return float(parts[idx]) if len(parts) > idx else 0.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    return {
+        "name":        _get(0),
+        "formid":      _get(1),
+        "region":      _get(2),
+        "hold":        _get(3),
+        "tags":        _get(4),
+        "is_interior": _get(5) == "1",
+        "factions":    _get(6),
+        "x":           _float(7),
+        "y":           _float(8),
+    }
+
+
+# ---------------------------------------------------------------------------
+# util_faction_name → FactionData
+# ---------------------------------------------------------------------------
+
+def parse_faction_name(data: str) -> Optional[dict]:
+    """util_faction_name → dict. /-delimited: formid/name"""
+    parts = data.split("/", 1)
+    if len(parts) < 2:
+        return None
+    return {"formid": parts[0].strip(), "name": parts[1].strip()}
+
+
+# ---------------------------------------------------------------------------
+# util_location_npc → NpcPosition
+# ---------------------------------------------------------------------------
+
+def parse_location_npc(data: str) -> Optional[dict]:
+    """util_location_npc → dict. /-delimited: npcName/x/y/z/tag"""
+    parts = data.split("/")
+    npc_name = parts[0].strip() if parts else ""
+    if not npc_name:
+        return None
+
+    def _float(idx: int) -> float:
+        try:
+            return float(parts[idx]) if len(parts) > idx else 0.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    return {
+        "npc_name": npc_name,
+        "x":        _float(1),
+        "y":        _float(2),
+        "z":        _float(3),
+        "tag":      parts[4].strip() if len(parts) > 4 else "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# named_cell → CellData
+# ---------------------------------------------------------------------------
+
+def parse_named_cell(data: str) -> Optional[dict]:
+    """named_cell → dict. /-delimited, 12 fields: cell topology."""
+    parts = data.split("/")
+    if not parts or not parts[0].strip():
+        return None
+
+    def _get(idx: int) -> str:
+        return parts[idx].strip() if len(parts) > idx else ""
+
+    def _float(idx: int) -> float:
+        try:
+            return float(parts[idx]) if len(parts) > idx else 0.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    return {
+        "cell_name":             _get(0),
+        "id":                    _get(1),
+        "location_id":           _get(2),
+        "interior":              _get(3) == "1",
+        "dest_door_cell_id":     _get(4),
+        "dest_door_exterior":    _get(5),
+        "door_id":               _get(6),
+        "worldspace":            _get(7),
+        "closed":                _get(8) == "1",
+        "door_name":             _get(9),
+        "door_x":                _float(10),
+        "door_y":                _float(11),
+    }
+
+
+# ---------------------------------------------------------------------------
+# named_cell_static → CellStaticItems
+# ---------------------------------------------------------------------------
+
+def parse_named_cell_static(data: str) -> Optional[dict]:
+    """named_cell_static → dict. /-delimited: cellId/comma-separated name@refid pairs"""
+    parts = data.split("/", 1)
+    if not parts or not parts[0].strip():
+        return None
+    cell_id = parts[0].strip()
+    items = []
+    if len(parts) > 1 and parts[1].strip():
+        for pair in parts[1].split(","):
+            item_parts = pair.strip().split("@", 1)
+            if item_parts and item_parts[0]:
+                items.append({
+                    "name":  item_parts[0].strip(),
+                    "refid": item_parts[1].strip() if len(item_parts) > 1 else "",
+                })
+    return {"cell_id": cell_id, "items": items}
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
 _PARSERS: dict[str, object] = {
-    "_speech":    parse_speech,
-    "addnpc":     parse_addnpc,
-    "updatestats": parse_updatestats,
-    "_quest":     parse_quest_json,
-    "_uquest":    parse_quest_update,
-    "_questdata": parse_quest_update,
-    "itemtransfer": parse_itemtransfer,
+    "_speech":            parse_speech,
+    "addnpc":             parse_addnpc,
+    "updatestats":        parse_updatestats,
+    "_quest":             parse_quest_json,
+    "_uquest":            parse_quest_update,
+    "_questdata":         parse_quest_update,
+    "itemtransfer":       parse_itemtransfer,
+    "util_location_name": parse_location_name,
+    "util_faction_name":  parse_faction_name,
+    "util_location_npc":  parse_location_npc,
+    "named_cell":         parse_named_cell,
+    "named_cell_static":  parse_named_cell_static,
 }
 
 

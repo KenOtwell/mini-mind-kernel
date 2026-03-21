@@ -1,6 +1,6 @@
 # Skyrim VR AI Companion — Full HerikaServer Replacement
 
-*Supersedes prior plan (shim approach). This is the authoritative architecture document.*
+*Authoritative architecture document for the Many-Mind Kernel.*
 
 ## Notes for Implementing Agent
 
@@ -401,16 +401,18 @@ The SKSE plugin (AIAgent.dll) communicates via simple HTTP POST. Our FastAPI end
 
 Falcon structurally decodes each event type's data field into typed Python objects. This is mechanical parsing, not semantic interpretation — Falcon doesn't know what the data means, just how to unpack it.
 
-**Implemented parsers** (in `event_parsers.py` as of Falcon build):
+**Parsers** (in `event_parsers.py`):
 * `_speech` → JSON deserialize → `SpeechData(listener, speaker, speech, location, companions, distance)`
 * `addnpc` → split on `@` → `NpcRegistration(name, base, gender, race, refid, skills{}, equipment{}, stats{}, mods[], factions[], class_info)`
 * `updatestats` → split on `@` → `NpcStats(npc_name, level, health, health_max, magicka, magicka_max, stamina, stamina_max, scale)`
 * `_quest` → JSON deserialize → `QuestData(form_id, name, brief, stage, giver, status)`
 * `_uquest`/`_questdata` → split on `@` → `QuestUpdate(form_id, briefing, stage)`
 * `itemtransfer` → regex parse → `ItemTransfer(source, dest, item_name, count)`
-
-**Not yet implemented** (will pass through as raw data in `TypedEvent.parsed_data=None`):
-* `util_location_name`/`named_cell`/`named_cell_static`/`util_faction_name`/`util_location_npc` → planned: `/`-split → typed location/cell structs
+* `util_location_name` → `/`-split → LocationData (name, formid, region, hold, tags, is_interior, factions, x, y)
+* `util_faction_name` → `/`-split → FactionData (formid, name)
+* `util_location_npc` → `/`-split → NpcPosition (npc_name, x, y, z, tag)
+* `named_cell` → `/`-split → CellData (cell_name, id, location_id, interior, door topology, 12 fields)
+* `named_cell_static` → `/`-split → CellStaticItems (cell_id, name@refid pairs)
 
 * All unrecognised types → raw string data preserved in a generic `TypedEvent(event_type, local_ts, game_ts, raw_data)` wrapper with `parsed_data=None`
 
@@ -497,7 +499,7 @@ Retrieval blends both axes via Qdrant `prefetch` + `FusionQuery(RRF)`. Emotional
 * Whether gradient-as-resistance is sufficient without subjective experience is an open question
 * For Skyrim NPCs: the resistance creates believable behavior regardless of the philosophical question
 
-### Concrete 9d Emotional Semagram (RESOLVED)
+### Concrete 9d Emotional Semagram
 
 The full emotional signature — the **semagram** — is a 9-dimensional coordinate. A semagram is a sign that carries meaning through its geometric structure, not through symbolic labels. Two memories resonate not because they share a tag, but because their semagrams point the same way. Mood-congruent recall falls out of dot products.
 
@@ -1231,7 +1233,8 @@ Falcon is deliberately minimal. It parses wire format, accumulates events, packa
 * `_quest` → JSON deserialize → `QuestData(form_id, name, brief, stage, giver, status)`
 * `_uquest`/`_questdata` → `@`-split → `QuestUpdate(form_id, briefing, stage)`
 * `itemtransfer` → regex → `ItemTransfer(source, dest, item_name, count)`
-* `util_*`/`named_cell` → `/`-split → typed location/cell structs
+* `util_location_name`/`util_faction_name`/`util_location_npc` → `/`-split → typed location/faction/position structs
+* `named_cell`/`named_cell_static` → `/`-split → typed cell topology/static item structs
 * Unknown/other types → generic `TypedEvent` wrapper preserving raw data
 
 **`tick_accumulator.py`** — Tick-based event buffer + package + ship cycle [Falcon]
@@ -1457,7 +1460,7 @@ Source: clone `abeiro/HerikaServer`, extract from `data/` directory and PHP arra
 ### Production Instance (Gaming PC)
 * Location: `C:\Tools\qdrant\qdrant.exe`
 * Ports: **6333** (REST) / **6334** (gRPC)
-* 12 existing collections (~1.2M points)
+* 17 collections (~1.2M+ points, 5 MMK collections added March 2026)
 * Both Falcon (localhost) and Progeny (LAN) connect here
 * Hosts all `skyrim_*` collections for the MMK
 
@@ -1477,13 +1480,9 @@ Source: clone `abeiro/HerikaServer`, extract from `data/` directory and PHP arra
 
 ## Open Design Questions
 
-* ~~**Emotional basis dimensionality**~~ — **RESOLVED**: 9d semagram. 8 emotional axes (fear, anger, love, disgust, excitement, sadness, joy, safety) + residual magnitude. See "Concrete 9d Emotional Semagram" section.
 * **Threshold tuning** — What delta magnitude = "significant" emotional shift? Likely needs per-agent calibration based on harmonic buffer decay rates.
 * **Agent activation logic** — Distance threshold? CHIM's NPC visibility list? Both?
 * **TTS/STT routing** — Keep CHIM's TTS components as separate service? Integrate? SKSE plugin expects audio file paths in some response modes.
 * **CHIM.exe launcher** — Currently acts as port proxy between SKSE and server. May need to bypass or replace, depending on whether SKSE connects directly or through CHIM.exe.
-* ~~**Emotional vector normalization**~~ — **RESOLVED**: Basis vectors are L2-normalized unit vectors. Agent state vectors (8d coordinates) are NOT normalized — their magnitude carries meaning (intensity). Use cosine similarity for retrieval (direction matters), dot product for intensity-weighted comparisons.
 * **Feature frequency tracking** — In-memory dict vs Qdrant payload aggregation? In-memory faster but needs persistence across restarts.
 * **LLM response validation** — How strictly validate LLM-proposed harmonics updates? Clamp magnitude? Smooth with EMA? Reject outliers?
-* **Multi-NPC group conversations** — CHIM supports group chats. Multiple active agents in one turn: sequential or parallel LLM calls?
-* ~~**Emotional dimensionality vs embedding model**~~ — **RESOLVED**: Emotional vectors are 9d semagrams: 8 projections from MiniLM's 384d space via dot product with orthogonal basis vectors + residual magnitude. They ARE derived from the embedding model but represent the agent's emotional state, not text content. Qdrant named vectors support different dimensions per name (semantic=384d, emotional=9d).

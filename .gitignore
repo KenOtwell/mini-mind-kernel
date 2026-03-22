@@ -1,6 +1,42 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
-*.7z
+*.py[cod]
+*$py.class
 *.egg-info/
-.pytest_cache/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Data files (large, generated)
+*.npz
+
+# Scaffolding snapshots
+*.7z
+
+# ChIM reference docs (binaries: .dll, .pex, .esp, .tar, .wav)
+# Source analysis only — not our code, not a dependency
+docs/AIAgent/
+docs/Dwemer Distro/
+
+# Logs
+*.log
+
+# Qdrant local data
+qdrant_data/

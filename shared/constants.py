@@ -106,6 +106,10 @@ COMMAND_VOCABULARY: frozenset[str] = frozenset({
     # Ceremonial/Special
     "Toast", "Drink", "StartRitualCeremony", "EndRitualCeremony",
     "Training", "UseSoulGaze",
+    # MMK extension — actor value dial-tuning
+    # Wire format: NPCName|command|SetBehavior@Aggression@2
+    # Handled by MMKSetBehavior.psc (CHIM_CommandReceived ModEvent)
+    "SetBehavior",
 })
 
 

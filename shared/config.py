@@ -87,7 +87,116 @@ class SchedulerConfig:
     tier3_cadence: int = 16   # every 16th
 
     max_agents_per_prompt: int = 16
+    max_parallel_slots: int = field(
+        default_factory=lambda: _env_int("SCHED_MAX_PARALLEL_SLOTS", 4)
+    )
     collaboration_floor_tier: int = 1  # min tier for collaborating NPCs
+
+
+@dataclass
+class ModelProfile:
+    """
+    LLM model profile — captures model-specific quirks and recommended settings.
+
+    BYOM users set LLM_PROFILE to a known model family (mistral-nemo, qwen2,
+    llama3, generic) or override individual settings via env vars. Progeny
+    adapts prompt format, sampling, and response parsing accordingly.
+    """
+    # Sampling
+    temperature: float = field(default_factory=lambda: _env_float("LLM_TEMPERATURE", 0.7))
+    top_p: float = field(default_factory=lambda: _env_float("LLM_TOP_P", 0.9))
+    repeat_penalty: float = field(default_factory=lambda: _env_float("LLM_REPEAT_PENALTY", 1.1))
+
+    # Chat template constraints
+    strict_alternation: bool = field(
+        default_factory=lambda: _env_bool("LLM_STRICT_ALTERNATION", False)
+    )
+    """If True, chat messages must alternate user/assistant. Consecutive
+    same-role messages are merged. Required for Mistral-family models."""
+
+    # JSON output support
+    supports_json_mode: bool = field(
+        default_factory=lambda: _env_bool("LLM_JSON_MODE", True)
+    )
+    """Whether the backend supports response_format: json_object.
+    If False, Progeny relies on prompt instructions + repair pass only."""
+
+    # Display name (for logging / health endpoint)
+    name: str = field(default_factory=lambda: _env("LLM_PROFILE", "generic"))
+
+
+# ---------------------------------------------------------------------------
+# Built-in profiles for known model families
+# ---------------------------------------------------------------------------
+
+MODEL_PROFILES: dict[str, dict] = {
+    "mistral-nemo": {
+        "temperature": 0.3,
+        "top_p": 0.9,
+        "repeat_penalty": 1.0,
+        "strict_alternation": True,
+        "supports_json_mode": True,
+        "name": "mistral-nemo",
+    },
+    "qwen2": {
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "repeat_penalty": 1.1,
+        "strict_alternation": False,
+        "supports_json_mode": True,
+        "name": "qwen2",
+    },
+    "llama3": {
+        "temperature": 0.6,
+        "top_p": 0.9,
+        "repeat_penalty": 1.1,
+        "strict_alternation": True,
+        "supports_json_mode": True,
+        "name": "llama3",
+    },
+    "dolphin": {
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "repeat_penalty": 1.1,
+        "strict_alternation": False,  # ChatML-based, flexible
+        "supports_json_mode": True,
+        "name": "dolphin",
+    },
+    "generic": {
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "repeat_penalty": 1.1,
+        "strict_alternation": False,
+        "supports_json_mode": True,
+        "name": "generic",
+    },
+}
+
+
+def load_model_profile() -> ModelProfile:
+    """
+    Load model profile from LLM_PROFILE env var, then overlay any
+    individual env var overrides on top.
+
+    Priority: individual env vars > profile defaults > generic defaults.
+    """
+    profile_name = _env("LLM_PROFILE", "generic")
+    base = MODEL_PROFILES.get(profile_name, MODEL_PROFILES["generic"]).copy()
+
+    # Env var overrides win over profile defaults.
+    # Only override if the env var is explicitly set.
+    if os.environ.get("LLM_TEMPERATURE"):
+        base["temperature"] = _env_float("LLM_TEMPERATURE", base["temperature"])
+    if os.environ.get("LLM_TOP_P"):
+        base["top_p"] = _env_float("LLM_TOP_P", base["top_p"])
+    if os.environ.get("LLM_REPEAT_PENALTY"):
+        base["repeat_penalty"] = _env_float("LLM_REPEAT_PENALTY", base["repeat_penalty"])
+    if os.environ.get("LLM_STRICT_ALTERNATION"):
+        base["strict_alternation"] = _env_bool("LLM_STRICT_ALTERNATION", base["strict_alternation"])
+    if os.environ.get("LLM_JSON_MODE"):
+        base["supports_json_mode"] = _env_bool("LLM_JSON_MODE", base["supports_json_mode"])
+
+    return ModelProfile(**base)
 
 
 @dataclass
@@ -98,6 +207,7 @@ class Settings:
     progeny: ProgenyConfig = field(default_factory=ProgenyConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    model: ModelProfile = field(default_factory=load_model_profile)
 
     debug: bool = field(default_factory=lambda: _env_bool("MMK_DEBUG", False))
     log_level: str = field(default_factory=lambda: _env("MMK_LOG_LEVEL", "INFO"))

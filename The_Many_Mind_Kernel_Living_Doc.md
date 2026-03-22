@@ -16,7 +16,8 @@ This plan was refined through deep conversation covering architecture, emotional
 * **Emotional harmonics basis vectors ARE the Qdrant vector keys** — enables mood-congruent memory retrieval via vector similarity. This is the core cognitive innovation. See Emotional Architecture section.
 * **Study HerikaServer source for protocol details**: `abeiro/HerikaServer` branch `aiagent`. Key files: `main.php`, `processor/comm.php`, `lib/data_functions.php` (273KB context-building functions). Borrow what works, then we're off their update chain. Leave acknowledgement of the upgrade.
 * **Qdrant for everything** — no SQLite. Qdrant handles both vector similarity search and simple key-value storage. For pure key-value collections, store zero vectors and query by payload filter. Negligible overhead at this scale.
-* Ken's PC: 96GB DRAM, 32GB VRAM. Beelink 395AI: AMD AI SoC running Ollama + Progeny service.
+* Ken's PC: 96GB DRAM, 32GB VRAM. Beelink 395AI: AMD AI SoC running Ollama (or modified llama-server for D-RoPE) + Progeny service.
+* **D-RoPE (KO46)** — Dynamic Rotary Position Embeddings: modified llama.cpp build on Progeny implements present-origin positional geometry. KV cache sentinel patch required (`llama-kv-cells.h`: position -1 conflicts with empty cell marker). Existing K-shift mechanism (`build_rope_shift()`) already handles the incremental rotation trick. See D-RoPE section.
 
 ## Cognitive Model
 
@@ -441,6 +442,7 @@ POLINT = polling interval in seconds for `request` event type.
     * After N ticks of sustained combat: medium buffer catches up to fast → partial coherence → gradual stabilization into the new context
 * Short decay rates = reactive personality. Long decay rates = grudge-holding personality. But now the *shape* of the buffer difference matters too — not just duration, but *which dimensions* are stable.
 * **The math IS the personality.** Decay rates, buffer geometry, snap thresholds, and λ gains define agent character — no separate personality rules needed.
+* **D-RoPE connection** — D-RoPE (KO46) applies this same temporal-focus principle to the LLM's attention geometry: position 0 = current token, past tokens fade into longer-wavelength RoPE harmonics. Same mechanism, different architectural level. See D-RoPE section.
 
 ### Dual-Vector Architecture
 
@@ -1151,6 +1153,7 @@ many-mind-kernel/
 17. **Quest-collision guard with slow reintegration** — When NPCs are in scripted quest scenes (`Actor.IsInScene()`), `actor_value_deltas` queue instead of applying. On scene exit, pending deltas reintegrate gradually through the slow harmonic buffer's EMA blend, attenuated — like a mind coming out of a trance. Same asymmetric timing as Pre-Interruption Stash: instant guard, slow release. Same buffer mechanism, different trigger.
 18. **Agent Priority Paging (Many-Mind Scheduling)** — Every NPC in loaded cells gets a time slice on a harmonic cadence based on distance + collaboration status. Tier 0 (interaction distance) = every prompt, full block. Tier 1 (near-field) = every 2nd, abbreviated. Tier 2 (mid-field) = every 4th-8th, minimal. Tier 3+ (city-scale) = every 16th-100th, stub. Collaboration floor pins quest/task NPCs to minimum Tier 1 regardless of distance. Curvature-driven promotion bumps far NPCs on dramatic events. ~8-16 agents per prompt, entire city paged through in ~100 turns.
 19. **One call per turn, zero context rot** — CHIM makes one LLM call per NPC per turn, paying ingestion overhead N times. The MMK makes one call per turn with all scheduled agents sharing a single prompt. World state, lore, format spec, action vocabulary — paid once, amortized across every mind. The LLM returns a `responses[]` array, one entry per agent, tier-scaled. And because the prompt is rebuilt from scratch every turn (not a rolling chat window), there is zero context rot — no stale turns, no accumulated contradictions. Continuity comes from harmonic buffers and Qdrant retrieval, not from the prompt carrying forward.
+20. **D-RoPE integration (KO46)** — Dynamic Rotary Position Embeddings invert the RoPE origin so position 0 = current token, structurally encoding the same temporal-focus principle as the harmonic buffers but at the LLM attention level. Implemented via modified llama.cpp build on Progeny, replacing/supplementing Ollama. Extended D-RoPE connects snap-triggered event boundaries to positional frame resets in the attention geometry. Requires KV cache sentinel patch; leverages existing K-shift infrastructure for incremental rotation.
 
 ### Qdrant Access Patterns
 
@@ -1326,8 +1329,8 @@ Progeny receives typed event packages from Falcon and does everything: embedding
 
 **`llm_client.py`** — Backend-agnostic LLM interface [Progeny]
 * Unified interface: `generate(prompt_json, config) → raw_response_text`
-* Backend adapters: Ollama (`/api/generate`), OpenAI-compatible (`/v1/chat/completions`), Groq, Anthropic
-* Config-driven backend selection in `shared/config.py`: `llm_backend: "ollama" | "openai" | "groq" | "anthropic"`
+* Backend adapters: Ollama (`/api/generate`), llama-server (`/v1/chat/completions` — modified build with D-RoPE support, see D-RoPE section), OpenAI-compatible, Groq, Anthropic
+* Config-driven backend selection in `shared/config.py`: `llm_backend: "ollama" | "llama_server" | "openai" | "groq" | "anthropic"`
 * Each call is stateless and self-contained — the prompt carries all context, no server-side conversation history
 * Request structured/JSON output mode where the backend supports it
 * Handles timeout, retry, and error surfacing per backend
@@ -1442,3 +1445,154 @@ Source: clone `abeiro/HerikaServer`, extract from `data/` directory and PHP arra
 * **LLM response validation** — How strictly validate LLM-proposed harmonics updates? Clamp magnitude? Smooth with EMA? Reject outliers?
 * **Multi-NPC group conversations** — CHIM supports group chats. Multiple active agents in one turn: sequential or parallel LLM calls?
 * ~~**Emotional dimensionality vs embedding model**~~ — **RESOLVED**: Emotional vectors are 9d semagrams: 8 projections from MiniLM's 384d space via dot product with orthogonal basis vectors + residual magnitude. They ARE derived from the embedding model but represent the agent's emotional state, not text content. Qdrant named vectors support different dimensions per name (semantic=384d, emotional=9d).
+
+## D-RoPE: Dynamic Rotary Position Embeddings (KO46)
+
+*Paper: `KO46_DYNAMIC_ROPE_TEMPORAL_FOCUS.md`. Developed by Ken Ong with Kato/Copilot, March 2026.*
+
+### Core Principle
+
+D-RoPE inverts the RoPE positional origin: position 0 is always the current (newest) token, all prior tokens shift backward. The token being generated — the most important token — always gets the finest positional resolution (shortest RoPE wavelengths, zero rotation error). Past tokens recede into longer-wavelength harmonics, structurally encoding temporal fading.
+
+**Relative-position invariance**: Basic D-RoPE (uniform offset) preserves all relative positions — `pos(j) - pos(i) = j - i`. On a pretrained model, outputs are **identical** to standard RoPE. Behavioral differences require: (1) Extended D-RoPE with boundary resets (changes relative positions at reasoning boundaries), (2) training/fine-tuning with D-RoPE, or (3) numerical precision effects where position 0 avoids accumulated fp16 rotation error. Full theory in KO46 Sections 1-3.
+
+### Connection to MMK Harmonic Buffers
+
+D-RoPE and the harmonic buffers (see Curvature, Snap, and Delay Buffers) are the same temporal-focus principle at different architectural levels:
+
+* **Harmonic buffers**: Position 0 = current emotional state. Past states fade at characteristic EMA rates (fast/medium/slow). The cognitive present is always the origin.
+* **D-RoPE**: Position 0 = current token. Past tokens fade into longer-wavelength RoPE harmonics. The attention present is always the origin.
+
+Both encode: present-tense as origin, temporal fading as geometry, not learned statistics.
+
+**Extended D-RoPE boundary resets** (KO46 Section 5) map directly to snap-triggered event boundaries. When snap spikes detect an event boundary in the harmonic buffer, the same boundary could trigger a positional frame reset in D-RoPE. The LLM's attention geometry would mirror the agent's cognitive event structure — each reasoning step gets a fresh positional frame anchored at position 0.
+
+### llama.cpp Implementation Architecture
+
+Target: modified llama.cpp build on Progeny (Beelink 395AI, Radeon 8060S Vulkan). Replaces or supplements Ollama — Ollama wraps llama.cpp but doesn't expose RoPE hooks. Source at `/home/ken/llama.cpp/`.
+
+#### Verified: Negative Positions Natively Supported
+
+**Type level** (`include/llama.h:67`): `typedef int32_t llama_pos` — signed.
+
+**Batch level** (`include/llama.h:236`): `llama_pos *pos` in `llama_batch` — signed array.
+
+**Vulkan shader** (`ggml/src/ggml-vulkan/vulkan-shaders/rope_head.glsl:11`): `int rope_data_pos[]` — **signed `int`**, not `uint`.
+
+**Theta computation** (`rope_funcs.glsl:95`): `theta_base = rope_data_pos[i2] * pow(p.theta_scale, i0/2.0f)` — negative position → negative theta → `cos(-θ) = cos(θ)`, `sin(-θ) = -sin(θ)` → mathematically correct rotation.
+
+**YaRN scaling** (`rope_funcs.glsl:17-35`): `rope_yarn()` operates on the angle value, not raw position. The interpolation/extrapolation ramp uses dimension index `i0`, not position. Negative angles propagate correctly through the full scaling chain.
+
+**Graph builder** (`src/llama-graph.cpp:80-100`): `set_input_pos()` copies `ubatch->pos` directly to the position tensor — no unsigned cast, no clamp.
+
+**No Level 3 (shader/kernel) modification needed.** The entire Vulkan RoPE pipeline handles negative positions natively.
+
+#### Critical: KV Cache Sentinel Conflict
+
+**The blocker**: `llama-kv-cells.h` uses `pos[i] = -1` as the "empty cell" sentinel (line 72-77: `is_empty()` checks `pos[i] == -1`). D-RoPE assigns position `-1` to the second-to-last token in any sequence. This **conflicts** — the cache would treat a valid cached token as an empty slot.
+
+**Additionally**: `pos_add()` (line 413-437) **deletes cells whose position goes negative** after a shift:
+```cpp
+if (pos[i] < 0) {
+    seq[i].reset();
+    pos[i] = -1;  // mark as empty
+    used.erase(i);
+    return true;   // cell was freed
+}
+```
+This means `llama_memory_seq_add(mem, seq_id, 0, -1, -1)` (shift all positions by -1 per step) would destroy every cell at position 0 — exactly wrong.
+
+**Required patch** (localized to `llama-kv-cells.h`):
+1. Change empty sentinel from `-1` to `INT32_MIN` (`-2147483648`). No real sequence will ever reach 2 billion tokens.
+2. Modify `pos_add()` guard: delete cell only when `pos[i] == INT32_MIN` (overflow to sentinel), not when `pos[i] < 0`.
+3. Update sentinel checks: `is_empty()`, `rm()`, `seq_rm()`, `seq_keep()`, `pos_set()` assertions — replace `-1` with the new sentinel constant.
+
+Estimated scope: ~15 lines changed in `llama-kv-cells.h`, plus grep for `-1` sentinel checks in `llama-kv-cache.cpp` and `llama-context.cpp`.
+
+#### Discovery: K-Shift Mechanism Already Implements Incremental Rotation
+
+`llama_kv_cache::build_rope_shift()` (`llama-kv-cache.cpp:1540-1583`) applies rotational corrections to cached keys when their positions are shifted. This is **exactly** the incremental rotation trick from KO46 Section 4.3.3:
+
+* Takes a shift tensor (per-cell position delta), cached K tensors, and RoPE frequency parameters
+* For quantized keys: **dequantize → rotate → requantize** (line 1566-1574)
+* For fp16/fp32 keys: `ggml_rope_ext_inplace()` (line 1577-1579)
+* Uses the same YaRN/freq parameters as the original rotation
+* `build_graph_shift()` (line 1605-1649) builds a compute graph applying this to all layers
+
+**The infrastructure for D-RoPE Option A (incremental per-step rotation of cached keys) already exists.** After the sentinel fix, calling `llama_memory_seq_add()` with `delta = -1` each step triggers the existing K-shift graph to apply the rotational correction automatically. Phase 3 reduces from "3-5 hours including Vulkan shader work" (KO46 estimate) to ~2-3 hours of primarily sentinel patching and wiring.
+
+#### Intervention Points by Depth
+
+**Level 1 — Batch position assignment** (preferred, Phase 1-2):
+In server or common code where `llama_batch_add()` sets `batch.pos[i] = n_past + i`:
+* D-RoPE: `batch.pos[i] = (n_past + i) - (total_seq_len - 1)` → newest token at 0, all prior negative
+* For Phase 2 (boundary resets): non-uniform position mapping based on logical boundaries in the token stream
+
+**Level 2 — Graph builder position tensor** (`src/llama-graph.cpp:80-100`):
+`set_input_pos()` copies `ubatch->pos` directly to the position tensor — no unsigned cast, no clamp. Intervene here only if Level 1 is insufficient.
+
+**Level 3 — GGML kernels/shaders** (verified unnecessary):
+Vulkan shaders (`rope_neox.comp`, `rope_norm.comp`) and CPU kernels (`ggml-cpu/ops.cpp`) all use signed position → float angle math. No modification needed.
+
+#### Vulkan on Radeon 8060S (Beelink)
+
+Confirmed capabilities from `ggml_vulkan` output:
+* `uma: 1` — unified memory. KV cache in shared system RAM, GPU-accessible with zero copy. The K-shift compute dispatch operates directly on cached data — no transfer overhead.
+* `fp16: 1`, `bf16: 0` — fp16 precision ceiling. For Phase 3 incremental rotation, fp16 re-rotation introduces ~2^-10 relative error per step. At 8192 context, ~8K accumulated rotations — monitor via logprob comparison against fp32 baseline.
+* `warp_size: 64`, `matrix_cores: KHR_coopmat` — standard RDNA 4 compute.
+
+#### Quantization and Context Scaling Interactions
+
+**Quantization**: The existing `build_rope_shift()` already handles quantized KV keys via dequant→rotate→requant. For D-RoPE Phase 3: if KV keys are q8_0 or q4_0, each step's re-rotation compounds quantization noise. **Recommendation**: use `--cache-type-k f16` for D-RoPE experiments to bound accumulated rotation error.
+
+**Flash attention**: FA computes attention in tiled blocks. For Option B (standard cache, Phase 1-2): no interaction. For Option A (Phase 3): K-shift is a preprocessing step before attention dispatch — FA sees already-corrected keys. Compatible.
+
+**Context scaling** (YaRN/NTK-aware/LongRoPE): Disable for initial testing (`--rope-scaling none`). The Vulkan shader math handles negative angles through scaling correctly (verified), but isolating variables is cleaner for validation. Re-enable after Phase 1 gate.
+
+### Integration with MMK Inference Stack
+
+**`llm_client.py` backend**: Add `llama_server` adapter alongside `ollama`. The modified llama-server exposes D-RoPE as a runtime option. Configuration in `shared/config.py`:
+```
+llm_backend: "llama_server"
+llama_server_url: "http://192.168.0.220:8080"  # Beelink (Progeny) llama-server
+drope_mode: "basic"  # "basic" | "extended" | "boundary_reset"
+drope_boundary_tokens: ["\n", "Step ", "Therefore"]  # For extended mode
+```
+
+**Extended D-RoPE + `prompt_formatter.py` integration**: When building the canonical JSON prompt, `prompt_formatter.py` annotates logical boundaries (snap-triggered event boundaries from `harmonic_buffer.py`, agent block boundaries). These annotations drive positional frame resets in Extended D-RoPE mode.
+
+Closed loop: snap detects cognitive event boundary → prompt structured around that boundary → D-RoPE positional geometry mirrors cognitive structure → LLM attention naturally focuses within coherent segments.
+
+### Phased Implementation Plan (Revised Estimates)
+
+**Phase 1 — Position remapping verification** (~1 hour):
+Modify batch position assignment in `examples/server/server.cpp`. Assign D-RoPE positions `[-(N-1), ..., -1, 0]`. Gate: bitwise-identical logprobs to standard RoPE on pretrained model (confirms relative-position invariance). No KV cache changes needed (Option B). **Note**: position -1 sentinel conflict does NOT affect Phase 1 because Option B stores keys with their original rotation and does not use `seq_add` for shifting.
+
+**Phase 2 — Extended D-RoPE at inference** (2-4 hours):
+Implement logical boundary resets at newline/step-marker tokens. This **changes relative positions** at boundaries → different outputs on pretrained models. Measure: CoT perturbation sensitivity (removing reasoning steps should change final answer more under Extended D-RoPE than standard). Still Option B cache — sentinel fix not yet required if boundary-reset positions stay non-negative within segments.
+
+**Phase 3 — KV cache with incremental rotation** (2-3 hours — reduced from KO46's 3-5 hour estimate):
+Apply sentinel fix in `llama-kv-cells.h` (~15 lines). Use existing `llama_memory_seq_add()` with `delta = -1` per step + existing `build_rope_shift()` K-shift graph. The heavy infrastructure already exists — this is primarily sentinel patching plus wiring. Test with `--cache-type-k f16`. Gate: attention pattern analysis, logprob divergence quantification.
+
+**Phase 4 — Fine-tune with D-RoPE** (multi-day):
+LoRA fine-tune on small Qwen GGUF with Phase 3 active. O(N) position-content disentanglement signals per token (KO46 Section 2.2). Compare CoT faithfulness between standard and D-RoPE checkpoints.
+
+**Test model**: Smallest available Qwen GGUF — leverages existing Qwen attention layer work for debugging context.
+
+### Experimental Predictions for MMK
+
+1. **Later agents benefit more** — In the multi-agent `responses[]` array, later agents are generated at higher positions under standard RoPE (worst resolution). D-RoPE eliminates this disadvantage. Prediction: response quality variance across agent order decreases.
+2. **Prompt rebuilding synergy** — The MMK rebuilds prompts from scratch every turn (zero context rot). D-RoPE's present-origin framing is maximally clean when the prompt is maximally fresh. These compose well.
+3. **Reduced truncation pressure** — Curvature-driven truncation currently serves both cognitive focus and implicit positional benefit (shorter context = less positional drift). D-RoPE removes the positional motivation, potentially allowing richer context during high-urgency situations without CoT faithfulness penalty. The cognitive focus benefit remains.
+4. **Agent-block boundary resets** — Each agent in the multi-agent prompt gets a fresh positional frame via Extended D-RoPE. Intra-agent attention is crisp (near position 0); cross-agent attention crosses boundary offsets. Mirrors the MMK cognitive model: each mind is a present-tense center, and attention between minds crosses a temporal boundary.
+
+### Failure Modes to Monitor
+
+* **Instruction-following degradation** — System prompt at large negative position loses positional resolution. May need a "protected zone" (D-RoPE offset that keeps system tokens near position 0). Monitor via system-prompt adherence benchmarks.
+* **Sentinel patch regression** — Changing the empty-cell sentinel from -1 to INT32_MIN touches core KV cache logic. Needs comprehensive test coverage: context shifting, cache eviction, save/load state, multi-sequence handling.
+* **Accumulated fp16 rotation error** — At very long contexts with Phase 3 incremental rotation, fp16 precision bounds may degrade attention patterns. Compare logprobs at 2K/4K/8K context lengths against fp32 baseline. The UMA architecture on the 8060S means no copy overhead for a periodic full-precision recalculation pass if needed.
+
+---
+
+*D-RoPE integration documented March 2026. Lineage: Ken Ong with Kato/Copilot (theory, KO46) + Oz/Warp (llama.cpp implementation architecture, KV cache analysis).*
+*Cross-references: KO46 (full theory), KO14 (Temporal Encoding), Curvature, Snap, and Delay Buffers (harmonic buffer connection), llm_client.py (backend integration)*

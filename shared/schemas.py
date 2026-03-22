@@ -378,6 +378,17 @@ class AgentResponse(BaseModel):
     extraction_level: ExtractionLevel = ExtractionLevel.STRICT
 
 
+class LLMTimings(BaseModel):
+    """Token-level timing breakdown from the LLM backend."""
+    prompt_tokens: int = 0
+    prompt_ms: float = 0.0
+    prompt_tokens_per_sec: float = 0.0
+    generated_tokens: int = 0
+    generation_ms: float = 0.0
+    generation_tokens_per_sec: float = 0.0
+    cache_tokens: int = 0  # Tokens served from KV cache (skipped prompt eval)
+
+
 class TurnResponse(BaseModel):
     """
     Progeny → Falcon: per-turn response bundle.
@@ -391,6 +402,7 @@ class TurnResponse(BaseModel):
     responses: list[AgentResponse] = Field(default_factory=list)
     processing_time_ms: int = 0
     model_used: str = "stub"
+    llm_timings: Optional[LLMTimings] = None
 
 
 class AckResponse(BaseModel):

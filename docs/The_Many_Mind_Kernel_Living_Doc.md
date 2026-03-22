@@ -721,6 +721,107 @@ This is not a hack — it mirrors how human cognition actually works. We don't h
 * No provenance flag, no source tracking. The adoption is total.
 * All adopted behavior flows through Progeny's `emotional_delta.py` for embedding and delta computation, same as LLM-generated output.
 
+## Goal Planner & Affordance System
+
+Agents need to act autonomously across time. When a player says "Go to Windhelm and fetch my good sword," the NPC needs to decompose that into steps, execute them across many ticks without LLM involvement, handle failures, and exploit opportunities. This is constraint-based state-space planning with the 43-command vocabulary as the operator library.
+
+### Architecture
+
+The LLM does **planning** (slow-twitch deliberation). The affordance matcher does **execution** (fast, no inference). The LLM does **replanning** when execution fails.
+
+**1. Goal Queue** (per agent, persisted in `skyrim_agent_state`)
+* Ordered list of goals, each decomposed into steps
+* Each step: `{command, target, item, precondition, done_when}`
+* LLM generates goals as part of its response — new `goals[]` field alongside `actions[]` and `utterance`
+* `actions[]` fires the first step immediately; `goals[]` persists the remaining plan for autonomous execution
+* Multiple goals coexist (fetch sword AND keep watch for bandits)
+
+**2. Affordance Set** (computed each tick by Progeny)
+* What the agent CAN do right now given: position, inventory, nearby objects/NPCs, current state
+* Built from Falcon's event data: `addnpc` (who's nearby), `util_location_npc` (positions), `updatestats` (state), `location` events, `named_cell_static` (what's in the cell)
+* Simple predicate matching: `at_location:X`, `near:X`, `has_item:X`, `player_has:X`, `is_alive:X`, `is_open:X`
+* Updated incrementally as events arrive — not recomputed from scratch
+
+**3. Goal-Affordance Matcher** (runs each tick BEFORE the LLM prompt)
+* Scan the agent's active goal: if the next step's precondition is satisfied by the current affordance set, emit the command immediately. No LLM call needed.
+* This is fast-twitch goal execution — the plan was slow-twitch (LLM deliberation), but executing known steps against satisfied preconditions is instant.
+* Step completion detected by checking `done_when` predicate against next tick's affordances. On completion, advance to next step.
+
+**4. Opportunism** (constraint propagation across all goals)
+* Don't just check the NEXT step — scan ALL goals for any step whose precondition is currently satisfied.
+* If Lydia is passing through Windhelm on another errand and the sword-fetch goal is queued, she grabs the sword now rather than waiting for that goal to become active.
+* Priority: current active goal > opportunistic match on other goals. Opportunistic matches don't interrupt active execution unless the opportunistic goal has higher emotional urgency (curvature).
+* This is E7 (Competitive Convergence) applied to goals — paths compete, the one with least resistance wins.
+
+**5. Replanning** (when steps fail)
+* Step fails: container locked, item missing, NPC hostile, path blocked → flag goal step as `blocked`
+* Next LLM prompt includes the blocked goal + failure context in the agent's state_history
+* LLM either replans (alternative path), adapts ("the sword isn't there, but I found a better one"), or abandons (report failure to player)
+* Emotional delta from failure feeds the harmonic buffers — frustration from repeated failures is real, affects future planning confidence
+
+### Example: "Go to Windhelm and get my good sword"
+
+LLM response:
+```json
+{
+  "agent_id": "Lydia",
+  "utterance": "I'll head to Windhelm and get your sword.",
+  "actor_value_deltas": { "Confidence": 3 },
+  "actions": [{ "command": "TravelTo", "target": "Windhelm" }],
+  "goals": [{
+    "description": "Retrieve player's Ebony Sword from Windhelm",
+    "steps": [
+      { "command": "TravelTo", "target": "Windhelm", "done_when": "at_location:Windhelm" },
+      { "command": "MoveTo", "target": "Hjerim", "done_when": "near:Hjerim" },
+      { "command": "PickupItem", "target": "Ebony Sword", "done_when": "has_item:Ebony Sword" },
+      { "command": "TravelTo", "target": "Player", "done_when": "near:Player" },
+      { "command": "GiveItemToPlayer", "target": "Ebony Sword", "done_when": "player_has:Ebony Sword" }
+    ]
+  }]
+}
+```
+
+`actions[]` fires `TravelTo Windhelm` immediately. The goal persists. Across subsequent ticks, the affordance matcher advances steps without LLM involvement. If something goes wrong (Hjerim is locked), the blocked state enters the next LLM prompt for replanning.
+
+### Deliberation → Habituation → Instinct (for Goals)
+
+Same pipeline as emotional processing, applied to task execution:
+* **Deliberation** — First time: LLM decomposes the goal into steps (~4 seconds). Full constraint reasoning in natural language.
+* **Habituation** — Execution: affordance matcher runs steps without LLM. The plan is cached in the goal queue. No inference needed until something breaks.
+* **Instinct** — Repeated similar goals: LLM retrieves previous plan from memory (via Qdrant — "last time I was sent to fetch something, here's what I did"), adapts it. Faster deliberation, better plans.
+
+### Connection to KO47 Invariants
+
+* **S8 (Dynamic Affordance Coupling)** — the affordance set IS S8. Computed each tick from the agent's coupling with its environment.
+* **E11 (Goal-Directed Coherence / Attractor Convergence)** — the goal-reality differential $\vec{D}_{signal} = \vec{S}_{goal} - \vec{S}_{reality}$ is checked every tick by the affordance matcher.
+* **E7 (Competitive Convergence)** — opportunism. Multiple goals compete; the one whose next step is currently satisfiable wins execution time.
+* **S9 (Energy Regulation)** — goals that repeatedly fail drain emotional energy (frustration). The agent may deprioritize or abandon costly goals.
+
+### Implementation
+
+**New Progeny module: `goal_planner.py`**
+* Goal queue management: add, advance, block, complete, abandon
+* Affordance set computation from accumulated event state
+* Goal-affordance matching (predicate evaluation)
+* Opportunistic scanning across all queued goals
+* Persistence: goal queue stored in `skyrim_agent_state` Qdrant collection (payload field)
+* Called each tick by Progeny's main loop, BEFORE prompt construction
+* If a step fires, the command goes directly to the response bundle (no LLM needed)
+
+**LLM response schema extension:**
+* New optional `goals[]` field in `AgentResponse`
+* Each goal: `{description, steps[{command, target, item, precondition, done_when}]}`
+* `response_expander.py` parses goals and persists to goal queue
+
+**Predicate vocabulary** (extensible):
+* `at_location:<name>` — agent is in named location
+* `near:<name>` — agent is within interaction distance of named entity/object
+* `has_item:<name>` — agent has item in inventory
+* `player_has:<name>` — player has item
+* `is_alive:<name>` — named NPC is alive
+* `is_dead:<name>` — named NPC is dead
+* `time_elapsed:<seconds>` — enough time has passed (for wait goals)
+
 ## Curvature-Driven Priority & Context Gating
 
 The system has no "combat mode" flag. Curvature and snap — the 1st and 2nd derivatives of emotional state tracked by `harmonic_buffer.py` — ARE the priority signals. Curvature shapes the prompt (how much context to include). Snap detects event boundaries (when to stash/flush). This section documents how both shape the pipeline from timing through prompt construction to post-danger recovery.

@@ -6,7 +6,7 @@
 
 This plan was refined through deep conversation covering architecture, emotional cognition theory, and wire protocol analysis. Architecture evolved into a **Falcon/Progeny two-service split**.
 
-* **TWO-SERVICE ARCHITECTURE (Falcon/Progeny)** — Falcon (Gaming PC) handles SKSE I/O, embedding, raw Qdrant writes. Progeny (Beelink) owns agent minds: event accumulation, LLM interaction, MOD/MAX Qdrant writes. Both access Qdrant directly — only deltas and keys cross the LAN wire.
+* **TWO-SERVICE ARCHITECTURE (Falcon/Progeny)** — Falcon (Gaming PC) handles SKSE I/O and writes inbound dialogue to Qdrant via a shared enrichment wrapper that auto-embeds on ingestion. Progeny (Beelink) owns agent minds: event accumulation, LLM interaction, memory retrieval, and writes LLM responses through the same Qdrant wrapper. Progeny returns keys to Falcon (not full text) — Falcon does a key lookup for wire formatting. Shared emotional projection logic lives in `shared/emotional.py`.
 * **FULL HerikaServer REPLACEMENT** — NOT a shim. Falcon replaces ALL of the PHP/Apache server. Only in-game CHIM mod files remain: AIAgent.dll (SKSE plugin), AIAgent.esp, Papyrus .pex scripts, AIAgent.ini (~10 files total).
 * **SKSE plugin source is closed** — C++ DLL not published. Wire protocol fully known from the open-source PHP server that receives its output (`comm.php`, `processor/comm.php`, `main.php`). Papyrus .pex scripts decompilable with Champollion if needed. Also check `abeiro/aiagent-aiff` on GitHub for earlier open-source Papyrus.
 * **AIAgent.ini** is the only config change: point `SERVER`/`PORT`/`PATH` at our FastAPI endpoint. Format: `SERVER=ip PORT=port PATH=/comm.php POLINT=1`
@@ -57,7 +57,7 @@ Both regimes use the same memory substrate, same Qdrant collections, same arc su
 
 ## Problem Statement
 
-Build a tight, packageable Python/FastAPI dual-service architecture (Falcon + Progeny) that fully replaces HerikaServer as the backend for Skyrim VR's CHIM mod. Falcon (Gaming PC) is a tick-based black-box decoder: accepts SKSE plugin events via HTTP, structurally parses wire format into typed data, accumulates events between ticks, and ships typed event packages (`TickPackage`) to Progeny over LAN. No embedding, no emotional computation, no Qdrant access — pure I/O substrate. Progeny (Beelink 395AI) owns ALL cognitive work: embedding, emotional delta computation, ALL Qdrant writes (RAW + MOD + MAX), memory retrieval, Many-Mind scheduling, prompt building, LLM interaction, and response parsing. Emotional harmonics drive memory storage, retrieval, and agent behavior via forward-hold credit assignment — no backpropagation.
+Build a tight, packageable Python/FastAPI dual-service architecture (Falcon + Progeny) that fully replaces HerikaServer as the backend for Skyrim VR's CHIM mod. Falcon (Gaming PC) is a tick-based black-box decoder: accepts SKSE plugin events via HTTP, structurally parses wire format into typed data, accumulates events between ticks, writes inbound dialogue to Qdrant via a shared enrichment wrapper (auto-embeds on ingestion), and signals Progeny that new content is ready. Progeny (Beelink 395AI) owns ALL cognitive work: memory retrieval, harmonic buffer management, Many-Mind scheduling, prompt building, LLM interaction, and response parsing. Progeny writes LLM responses through the same Qdrant wrapper (text in → key out), and returns keys to Falcon over HTTP. Falcon reads response text from Qdrant by key for wire formatting. Both services share the Qdrant wrapper API and the emotional projection math in `shared/emotional.py`. Emotional harmonics drive memory storage, retrieval, and agent behavior via forward-hold credit assignment — no backpropagation.
 
 ## System Architecture
 
@@ -65,22 +65,27 @@ Build a tight, packageable Python/FastAPI dual-service architecture (Falcon + Pr
 GAMING PC — FALCON                         BEELINK 395AI — PROGENY
 +-------------------------------------+   +-------------------------------------+
 | Skyrim VR -> SKSE -> AIAgent.dll     |   | Progeny Service (FastAPI)           |
-|    |                                 |   |   - Embedding (all-MiniLM, CPU)    |
+|    |                                 |   |   - Harmonic buffer memory         |
 | Falcon Service (FastAPI :8000)       |   |   - Emotional delta computation    |
 |   - Wire protocol (SKSE <-> JSON)    |LAN|   - Memory retrieval (dual-vector) |
-|   - Structural parsing (typed data)  |<->|   - Harmonic buffer memory         |
-|   - Tick-based event accumulator     |   |   - Many-Mind scheduling           |
-|   - Response queue (dequeue to SKSE) |   |   - Prompt building                |
-|   |                                  |   |   - Response parsing               |
-|   | (no writes — pure I/O substrate) |   |   |                                |
-| Qdrant (localhost:6333/6334)         |   | Ollama (local LLM)                 |
-+-------------------------------------+   |   | ALL writes (RAW/MOD/MAX)       |
-| Virtual Desktop Streamer (Quest 3)   |   | Qdrant (GamingPC:6333 over LAN)    |
-+-------------------------------------+   +-------------------------------------+
+|   - Structural parsing (typed data)  |<->|   - Many-Mind scheduling           |
+|   - Tick-based event accumulator     |   |   - Prompt building                |
+|   - Response queue (dequeue to SKSE) |   |   - Response parsing               |
+|   |                                  |   |   |                                |
+|   | Qdrant wrapper (write + embed)   |   | Ollama (local LLM)                 |
+|   | Key lookup (read response text)  |   |   |                                |
+| Qdrant (localhost:6333/6334)         |   | Qdrant wrapper (write + embed)     |
++-------------------------------------+   | Qdrant (GamingPC:6333 over LAN)    |
+| Virtual Desktop Streamer (Quest 3)   |   +-------------------------------------+
++-------------------------------------+
 
-Wire: Falcon->Progeny carries typed event packages (structured, not raw wire strings).
-Progeny->Falcon carries response bundles (dialogue + actions + actor_value_deltas).
-Progeny accesses Qdrant directly for ALL read/write tiers.
+INBOUND:  CE → Falcon → Qdrant wrapper (write + auto-embed) → signal Progeny
+OUTBOUND: Progeny → Qdrant wrapper (write + auto-embed) → keys via HTTP → Falcon
+          Falcon reads response text from Qdrant by key → formats to SKSE wire
+Progeny reads from Qdrant for retrieval and rehydration.
+
+Shared: emotional projection in shared/emotional.py
+        Qdrant wrapper: text in → key + vectors out (single enrichment gate)
 ```
 
 **No PHP. No Apache. No HerikaServer.** Falcon IS the SKSE-facing backend. Progeny IS the mind.
@@ -91,17 +96,20 @@ Tick-based data flow:
 1. SKSE plugin POSTs game events to Falcon continuously (`type|localts|gamets|data`)
 2. Falcon: parse wire format, decode data fields into typed structures (JSON, `@`-delimited, `/`-delimited → clean Python objects). No semantic interpretation — just structural decoding.
 3. Falcon: accumulate typed events in a time-ordered buffer between ticks
-4. Falcon: on tick (every ~1-3 seconds), snapshot the buffer, wrap as a typed event package, POST to Progeny, clear the buffer
-5. Progeny: receive typed event package, parse semantic meaning, embed text (all-MiniLM, CPU), compute emotional deltas, project to 9d semagrams
-6. Progeny: write RAW events to Qdrant (immutable, with emotional vectors attached)
-7. Progeny: update harmonic buffers (curvature, snap, λ), determine who to wake via Many-Mind scheduling
-8. Progeny: retrieve relevant memories from Qdrant (dual-vector + referent + recency + anchors)
-9. Progeny: build canonical JSON prompt from accumulated state + retrieved memories
-10. Progeny → Ollama: send prompt, receive structured JSON response
-11. Progeny: parse response, write MOD/MAX (arc summaries, compressed chunks) to Qdrant
-12. **Progeny: run LLM-generated response text through the same emotional delta pipeline** — embed, project to 9d, compute delta against held state, update curvature/snap, write RAW point. The agent's own words shift its emotional state the same way incoming events do.
-13. Progeny → Falcon: return response bundle (dialogue + actions + actor_value_deltas)
-14. Falcon: enqueue responses, serve to SKSE on next `request` poll as CHIM wire format (`NPCName|DialogueType|Text\r\n`)
+4. Falcon: on tick, write inbound dialogue/text to Qdrant via shared enrichment wrapper (auto-embeds semantic 384d + emotional 9d on ingestion → returns key)
+5. Falcon: signal Progeny — "dialogue_ready" + Qdrant key + source
+6. Progeny: read content from Qdrant by key (vectors already computed by wrapper)
+7. Progeny: compute emotional deltas against held harmonic state, update curvature/snap/λ
+8. Progeny: update harmonic buffers, determine who to wake via Many-Mind scheduling
+9. Progeny: retrieve relevant memories from Qdrant (dual-vector + referent + recency + anchors)
+10. Progeny: build canonical JSON prompt from accumulated state + retrieved memories
+11. Progeny → Ollama: send prompt, receive structured JSON response
+12. Progeny: parse response, write LLM response text to Qdrant via same wrapper (auto-embeds → key)
+13. **Progeny: run LLM-generated response text through the same emotional delta pipeline** — the agent's own words shift its emotional state the same way incoming events do.
+14. Progeny: write MOD/MAX (arc summaries, compressed chunks) to Qdrant
+15. Progeny → Falcon: return response keys + actions + actor_value_deltas (keys only, not full text)
+16. Falcon: read response text from Qdrant by key, format to SKSE wire, enqueue for polling
+17. Falcon: serve to SKSE on next `request` poll as CHIM wire format (`NPCName|DialogueType|Text\r\n`)
 
 ## Falcon / Progeny Two-Service Architecture
 
@@ -109,25 +117,27 @@ The Many-Mind Kernel splits into two cooperating FastAPI services. The naming re
 
 ### Falcon (Gaming PC) — Tick-Based Black-Box Decoder
 
-Falcon is the substrate layer on structured time. A lightweight metronome that decodes the SKSE wire format into typed data and ships it. It does NOT interpret, compute semantics, embed text, or access Qdrant for cognitive work. It runs on the Gaming PC alongside Skyrim — minimal CPU footprint on spare cores of the 9950X3D while the 5090 renders.
+Falcon is the substrate layer on structured time. A lightweight metronome that decodes the SKSE wire format into typed data. It does NOT interpret, compute semantics, or embed text. It runs on the Gaming PC alongside Skyrim — minimal CPU footprint on spare cores of the 9950X3D while the 5090 renders.
 
 * SKSE wire protocol parsing (pipe-delimited → typed Python objects)
 * Structural data decoding — parse `@`-delimited, `/`-delimited, and JSON data fields into clean typed structures per event type. Mechanical, deterministic, no semantic interpretation.
-* Tick-based event accumulation — events arrive continuously, accumulate in a time-ordered buffer. On each tick (~1-3 seconds), snapshot and ship.
-* Package and ship — wrap typed event buffer as a structured package, POST to Progeny over LAN
-* Response queue — receive response bundles from Progeny, enqueue locally, serve to SKSE on `request` polls
-* CHIM wire formatting — format response bundles as `NPCName|DialogueType|Text\r\n` for SKSE
+* Tick-based event accumulation — events arrive continuously, accumulate in a time-ordered buffer. On each tick (~1-3 seconds), snapshot.
+* **One write path** — inbound dialogue/text → Qdrant via shared enrichment wrapper (auto-embeds on ingestion). Falcon writes raw content, wrapper handles all embedding.
+* **One read path** — key-based point lookup to read response text for wire formatting. Not a search — just a cache fetch by Qdrant key.
+* Signal Progeny — notify that new content is ready + pass Qdrant keys
+* Response queue — receive response keys from Progeny, read text from Qdrant by key, enqueue locally, serve to SKSE on `request` polls
+* CHIM wire formatting — format responses as `NPCName|DialogueType|Text\r\n` for SKSE
 * Handle `request` locally — dequeue and return responses without involving Progeny
-* Stateless — no per-agent buffers, no emotional state, no memory, no embeddings
+* Stateless — no per-agent buffers, no emotional state, no memory, no embeddings. Does not compute embeddings (wrapper does).
 
 ### Progeny (Beelink 395AI) — Stateful Mind Owner
 
-Progeny owns ALL cognitive work. It receives typed event packages from Falcon and does everything semantic: embedding, emotional projection, memory, scheduling, prompting, LLM interaction, and ALL Qdrant writes. The urgency of processing is emergent — Progeny doesn't get wait states, it just processes incoming packages and responds as fast as it can.
+Progeny owns ALL cognitive work. It reads content from Qdrant (pre-embedded by the shared wrapper), computes emotional deltas, manages harmonic state, retrieves memories, builds prompts, runs LLM inference, and writes LLM responses through the same Qdrant wrapper. The urgency of processing is emergent — Progeny doesn't get wait states, it just processes incoming signals and responds as fast as it can.
 
-* Embedding (all-MiniLM-L6-v2, CPU on Beelink) — text content embedding for semantic search and emotional projection
-* Emotional delta computation — **bidirectional**: processes both inbound game events AND outbound LLM response text through the same embed → project → delta pipeline. Progeny is the single authority on emotional state.
-* ALL Qdrant writes — RAW (immutable events with emotional vectors), MOD (arc summaries), MAX (compressed essence). Single write authority simplifies discipline.
-* Memory retrieval from Qdrant (dual-vector search, referent filtering, recency decay, anchor boosting)
+* Emotional delta computation — **bidirectional**: processes both inbound game events AND outbound LLM response text through the same project → delta pipeline. Progeny is the single authority on emotional state. Embeddings arrive pre-computed from Qdrant (wrapper handles embedding on ingestion).
+* LLM response writes — through the same Qdrant wrapper as Falcon. Text in → key out. Returns keys to Falcon, not full text.
+* MOD/MAX writes — arc summaries and compressed essences written directly to Qdrant.
+* Memory retrieval from Qdrant (dual-vector search, referent filtering, recency decay, anchor boosting). Progeny never needs to re-embed for retrieval — vectors are already stored from ingestion.
 * Event accumulation (buffer per-agent across turns, detect turn boundaries)
 * Harmonic buffer memory per agent (fast/medium/slow 9d buffers, curvature, snap, λ, cross-buffer coherence)
 * Many-Mind scheduling — determine who to wake, allocate prompt slices by tier
@@ -139,15 +149,17 @@ Progeny owns ALL cognitive work. It receives typed event packages from Falcon an
 * Privacy filtering on retrieved memories
 * Stateful — maintains agent mind state between turns
 
-### The Wire Principle: Typed Packages Forward, Response Bundles Back
+### The Wire Principle: Qdrant as Buffer, Keys Over the Wire
 
-Falcon→Progeny communication carries **typed event packages** — structured, decoded data, not raw wire strings and not just keys. Progeny→Falcon carries **response bundles**. The packages are larger than "just keys" because Falcon no longer does cognitive pre-processing. The tradeoff: Falcon stays trivially lightweight on the Gaming PC, and all semantic work concentrates on the Beelink.
+Qdrant is the shared buffer between Falcon and Progeny. Both services write through the same enrichment wrapper (text in → key + auto-embedded vectors out). Communication between services carries **keys and signals**, not raw text payloads.
 
-* **Falcon → Progeny**: typed event packages (time-ordered buffer of structurally parsed events with timestamps and decoded data fields intact)
-* **Progeny → Falcon**: response bundles (dialogue + actions[] + actor_value_deltas per agent)
-* Progeny accesses Qdrant directly for ALL read/write tiers (RAW + MOD + MAX)
-* Falcon does NOT access Qdrant for cognitive work — it is pure I/O substrate
-* LAN traffic is structured event data (modest volume — game events are small) and response bundles (compact)
+* **Falcon → Qdrant wrapper**: inbound dialogue/text → auto-embedded → stored with dual vectors → key returned
+* **Falcon → Progeny**: signal ("dialogue_ready" + Qdrant key + source). Lightweight notification, not a full payload.
+* **Progeny → Qdrant wrapper**: LLM response text → auto-embedded → stored → key returned
+* **Progeny → Falcon**: response keys + actions[] + actor_value_deltas per agent. Keys only (~36 bytes each), not full dialogue text.
+* **Falcon ← Qdrant**: key-based point lookup to read response text for wire formatting. Not a search — just a fetch.
+* Progeny reads from Qdrant for retrieval, rehydration, and harmonic state recovery.
+* LAN traffic is signals and keys (minimal), not structured text payloads.
 
 ### Zero-Init Pattern
 
@@ -1362,21 +1374,31 @@ many-mind-kernel/
 
 ### Qdrant Access Patterns
 
-Progeny is the sole Qdrant client for cognitive work. Falcon does NOT access Qdrant. All reads and writes go through Progeny over LAN (GamingPC:6333).
+Qdrant is the shared memory substrate. Both Falcon and Progeny write through the same **enrichment wrapper** (text in → auto-embed semantic 384d + emotional 9d → store → return key). Progeny owns all cognitive reads (retrieval, rehydration, state recovery). Falcon has one key-lookup read for wire formatting.
 
-**Progeny — ALL Reads:**
+**Qdrant Enrichment Wrapper (shared, used by both services):**
+* Accepts raw text → runs all-MiniLM (384d semantic) + emotional projection (9d semagram via `shared/emotional.py`) → stores point with dual vectors → returns Qdrant key
+* Single enrichment gate: every piece of text entering the system gets its semantic fingerprint automatically. Nothing is stored without embeddings.
+* Both Falcon and Progeny call the same wrapper API — one write interface, one embedding path.
+
+**Falcon — Writes (inbound):**
+* Inbound dialogue/text from SKSE → Qdrant wrapper → key returned → signal Progeny
+
+**Falcon — Reads (outbound, key-lookup only):**
+* Read response text from Qdrant by key for wire formatting. Not a search — a point lookup.
+
+**Progeny — Writes:**
+* LLM response text → Qdrant wrapper (same API as Falcon) → key returned → key sent to Falcon
+* MOD tier: arc summaries (generated by `compression.py`)
+* MAX tier: compressed essence (LLM-based distillation via `compression.py`)
+* Agent state snapshots to `skyrim_agent_state`
+
+**Progeny — ALL Cognitive Reads:**
 * `memory_retrieval.py` runs multi-axis search (emotional + semantic + referent + recency + anchors)
 * `bundle_manager.py` and `rehydration.py` expand keys into full context bundles
 * `harmonic_buffer.py` reads/updates running emotional state from `skyrim_agent_state`
-* Recency-weighted: most recent memories ranked highest via exponential time-decay on game-time delta
+* Progeny never needs to re-embed for retrieval — vectors are pre-computed and stored at ingestion time
 * This is NOT training — no gradient, no credit assignment, no weight updates. Pure context retrieval for prompt construction.
-
-**Progeny — ALL Writes (single write authority):**
-* RAW tier: immutable events with emotional vectors attached (computed by Progeny's `emotional_delta.py`)
-* MOD tier: arc summaries (generated by `compression.py`)
-* MAX tier: compressed essence (LLM-based distillation via `compression.py`)
-* All tiers write to the same collections — tier is a payload field, not a collection boundary
-* Single write authority eliminates cross-service write conflicts and simplifies rollback/cleanup
 
 ## Module Details
 

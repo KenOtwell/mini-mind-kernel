@@ -10,6 +10,11 @@ Axis 8:   residual magnitude — how much semantic content the 8 axes
 
 The bases are perfectly orthonormal (max off-diagonal dot ~1e-16).
 Projection is a simple dot product — no inverse needed.
+
+NOTE: This module is a candidate to move to shared/emotional.py so that
+both the Qdrant enrichment wrapper (used by Falcon and Progeny for
+auto-embed on ingestion) and Progeny's harmonic buffer logic share
+the same projection math. The API will remain identical.
 """
 from __future__ import annotations
 

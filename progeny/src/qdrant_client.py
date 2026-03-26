@@ -1,12 +1,20 @@
 """
 Qdrant async client for Progeny — dual-vector memory store.
 
-Thin async wrapper around qdrant-client. Progeny is the single write
-authority for all memory tiers (RAW/MOD/MAX) and agent state. Falcon
-never touches Qdrant.
+Thin async wrapper around qdrant-client. Qdrant is the shared memory
+substrate — both Falcon and Progeny write through the same enrichment
+wrapper API (text in → auto-embed → store → return key). Progeny owns
+all cognitive reads (retrieval, rehydration, state recovery). Falcon
+has one write path (inbound dialogue via wrapper) and one key-lookup
+read path (outbound response text for wire formatting).
+
+NOTE: write_memory() currently takes pre-computed vectors. The
+enrichment wrapper (planned: shared/qdrant_wrapper.py using
+shared/emotional.py for projection) will provide a text-in/key-out
+interface that auto-embeds on ingestion. write_memory() will be
+called by the wrapper, not directly by services.
 
 Connection target: Gaming PC Qdrant at config.qdrant.host:rest_port.
-Both services share the same instance; Progeny owns all writes.
 
 Named vector schema for skyrim_npc_memories:
   "semantic"  — 384d Cosine  (all-MiniLM content embedding)

@@ -255,16 +255,32 @@ When NPCs are in scripted quest sequences, the Creation Engine's quest AI owns t
 
 ## Current State
 
-**GitHub**: https://github.com/KenOtwell/many-mind-kernel (public, MIT). Falcon + Progeny code, shared schemas, 84 tests passing. Both Falcon (StealthVI) and Progeny (Beelink) pull from this repo.
+**GitHub**: https://github.com/KenOtwell/many-mind-kernel (public, MIT). Falcon + Progeny code, shared schemas, **400 tests passing**. Both Falcon (StealthVI) and Progeny (Beelink) pull from this repo.
 
 **Qdrant Instance**: `C:\Tools\qdrant\qdrant.exe` — ports 6333 (REST) / 6334 (gRPC), bound to `0.0.0.0` (LAN-accessible). Config: `C:\Tools\qdrant\config.yaml`. Progeny (Beelink at `192.168.0.220`) confirmed connecting to `192.168.0.13:6333`.
 
-**Progeny Qdrant Wrapper Modules** (committed, in `progeny/src/`):
-* `qdrant_client.py` — Async module-level API: `init()`, `get_client()`, `ensure_collections()`, `write_memory()`, `write_agent_state()`, `read_agent_state()`, `search_memories()` (RRF fusion), plus generic helpers (`get_points_by_ids`, `scroll_filtered`, `search_vector`, `set_point_payload`). AsyncQdrantClient singleton, dual-vector (semantic 384d + emotional 9d).
-* `memory_writer.py` — MemoryWriter: async RAW/MOD/MAX tier writes, world events, agent state snapshots, session stash, lore. Uses `get_client()` directly.
-* `memory_retrieval.py` — MemoryRetriever: async λ(t)-weighted dual-vector search, recency decay, referent boosting, arc expansion. Uses `search_vector()` for separate axis passes.
-* `compression.py` — ArcCompressor (snap-threshold → MOD) + EssenceDistiller (MOD groups → MAX). Async, uses `scroll_filtered()` and `get_points_by_ids()`.
-* `rehydration.py` — Rehydrator: async MAX→MOD→RAW expansion chain, post-interruption stash recovery. Uses module-level helpers.
+**Shared Enrichment Layer** (committed, in `shared/`):
+* `emotional.py` — 384d → 9d semagram projection. Basis loading, single/batch projection, residual computation. Used by both Falcon and Progeny.
+* `embedding.py` — all-MiniLM-L6-v2 sentence embeddings on CPU. Singleton model loading, batch/single embed. Used by both Falcon and Progeny.
+* `qdrant_wrapper.py` — **The enrichment gate.** `ingest()`: text in → embed (384d) → project (9d) → store dual-vector point → return key. `read_text()`: key-based point lookup. Both services call the same API.
+* `schemas.py` — `AgentResponse.utterance_key`: Progeny can return a Qdrant key instead of inline text. Falcon resolves via `read_text()`. Falls back to inline `utterance` (backward compat).
+
+**Falcon Enrichment Wiring** (committed):
+* `server.py` — Startup loads embedding model + emotional bases + initializes AsyncQdrantClient (localhost).
+* `routes.py` — `_resolve_utterance_keys()`: when Progeny returns `utterance_key`, Falcon reads text from Qdrant by key before wire formatting. Session events now forwarded to tick accumulator for Progeny visibility.
+* Response queue bounded at `maxlen=64`.
+
+**Progeny Qdrant Modules** (committed, in `progeny/src/`):
+* `qdrant_client.py` — Async module-level API: `init()`, `get_client()`, `ensure_collections()`, `write_memory()`, `write_agent_state()`, `read_agent_state()`, `search_memories()` (RRF fusion), plus generic helpers. NOTE: `write_memory()` currently takes pre-computed vectors; RAW writes will flow through the shared wrapper once Progeny's response pipeline is updated.
+* `memory_writer.py` — MemoryWriter: async RAW/MOD/MAX tier writes, world events, agent state snapshots, session stash, lore.
+* `memory_retrieval.py` — MemoryRetriever: async λ(t)-weighted dual-vector search, recency decay, referent boosting, arc expansion.
+* `compression.py` — ArcCompressor (snap-threshold → MOD) + EssenceDistiller (MOD groups → MAX).
+* `rehydration.py` — Rehydrator: async MAX→MOD→RAW expansion chain, post-interruption stash recovery.
+* `embedding.py`, `emotional_projection.py` — Re-export shims pointing to `shared/embedding.py` and `shared/emotional.py`.
+
+**Remaining Progeny work to close the keys-over-wire loop:**
+* `response_expander.py` — Write LLM utterances via `shared.qdrant_wrapper.ingest()` instead of inline.
+* Set `AgentResponse.utterance_key` instead of `AgentResponse.utterance` when returning to Falcon.
 
 **MMK Qdrant Collections** (5 new, 17 total):
 * `skyrim_npc_memories` — dual named vectors (semantic:384d + emotional:9d), indexes: agent_id, tier, game_ts, privacy_level
@@ -358,7 +374,7 @@ The SKSE plugin (AIAgent.dll) communicates via simple HTTP POST. Our FastAPI end
 * `goodnight` — Night cycle event. **MMK**: Falcon logs and returns empty. (In HerikaServer: triggers auto-diary for nearby NPCs.)
 * `waitstart` — Player begins waiting/sleeping. **MMK**: Falcon logs and returns empty. (In HerikaServer: stores gamets, triggers auto-diary.)
 * `waitstop` — Player finishes waiting/sleeping. **MMK**: Falcon logs and returns empty. (In HerikaServer: computes elapsed hours from `waitstart` gamets, logs time-forward event.)
-* NOTE: Session semantics (rollback, diary generation, Dragon Break snapshots) will be Progeny's responsibility when session event forwarding is implemented. Currently these are stub-handled on Falcon.
+* NOTE: Session events are now forwarded to the tick accumulator (as of March 2026) so Progeny receives them in TickPackages. Progeny-side session handling (rollback, diary generation, Dragon Break snapshots) is not yet implemented.
 
 **NPC registration and stats** (`addnpc` is the richest event — 43+ fields):
 * `addnpc` — NPC enters loaded cells. Data = `@`-delimited, 43+ fields:
@@ -1284,13 +1300,16 @@ many-mind-kernel/
 |-- pyproject.toml
 |-- requirements.txt
 |
-|-- shared/                              # Shared types, schemas, constants
-|   |-- schemas.py                       # Canonical JSON schema, wire types, typed event models
-|   |-- config.py                        # Qdrant URL, ports, model config, thresholds
-|   |-- constants.py                     # Emotional dimensions, event types, tier names
-|   +-- data/
-|       |-- emotional_bases_9d.npz       # 9d semagram: 8 emotion bases + residual metadata
-|       +-- emotional_bases_8d.npz       # Original 8d bases (retained for reference)
+||-- shared/                              # Shared types, schemas, constants, enrichment layer
+||   |-- schemas.py                       # Canonical JSON schema, wire types, typed event models
+||   |-- config.py                        # Qdrant URL, ports, model config, thresholds
+||   |-- constants.py                     # Emotional dimensions, event types, tier names
+||   |-- embedding.py                     # all-MiniLM-L6-v2 sentence embeddings (shared by both services)
+||   |-- emotional.py                     # 384d → 9d emotional projection (shared by both services)
+||   |-- qdrant_wrapper.py                # Enrichment gate: text → embed → project → store → key
+||   +-- data/
+||       |-- emotional_bases_9d.npz       # 9d semagram: 8 emotion bases + residual metadata
+||       +-- emotional_bases_8d.npz       # Original 8d bases (retained for reference)
 |
 |-- falcon/                              # GAMING PC - tick-based black-box decoder
 |   |-- src/
@@ -1310,10 +1329,11 @@ many-mind-kernel/
 |       +-- test_round_trip.py
 |
 |-- progeny/                             # BEELINK 395AI - stateful mind owner (ALL cognitive work)
-|   |-- src/
-|   |   |-- __init__.py
-|   |   |-- embedding.py                 # Semantic embedding (all-MiniLM-L6-v2, CPU)
-|   |   |-- emotional_delta.py           # Bidirectional emotional delta: embed -> 9d project -> delta
+||   |-- src/
+||   |   |-- __init__.py
+||   |   |-- embedding.py                 # Re-export shim → shared/embedding.py
+||   |   |-- emotional_projection.py      # Re-export shim → shared/emotional.py
+||   |   |-- emotional_delta.py           # Bidirectional emotional delta: embed -> 9d project -> delta
 |   |   |-- memory_retrieval.py          # Multi-axis retrieval (emotional+semantic+referent+recency+anchors)
 |   |   |-- privacy.py                   # 4-level privacy model (PRIVATE/SEMI_PRIVATE/COLLECTIVE/ANONYMOUS)
 |   |   |-- event_accumulator.py         # Turn-based event buffering, turn boundary detection
@@ -1354,8 +1374,8 @@ many-mind-kernel/
 
 1. **Full server replacement** — No PHP dependency. `AIAgent.ini` points at Falcon. We ARE the backend.
 2. **Falcon as tick-based black-box decoder** — CHIM is a white-box encoder (classify every event, trigger explicit handlers). Falcon is a black-box decoder (tick-based metronome: wake, scrape, parse structure, package, ship, sleep). Falcon does NOT interpret meaning — it decodes wire format into typed data. All semantic work lives on Progeny.
-3. **Progeny owns ALL cognitive work + ALL Qdrant writes** — Embedding, emotional delta, memory retrieval, scheduling, prompting, LLM interaction, and ALL writes (RAW + MOD + MAX). Single write authority simplifies discipline. Falcon does not access Qdrant.
-4. **Typed packages forward, response bundles back** — Falcon→Progeny sends typed event packages (structurally parsed, not raw wire strings). Progeny→Falcon sends response bundles (dialogue + actions + actor_value_deltas). Bigger than "just keys" but Falcon stays trivially lightweight.
+3. **Qdrant enrichment wrapper as shared write gate** — Both Falcon and Progeny write through `shared/qdrant_wrapper.py` (text in → auto-embed → store → key out). Embedding and emotional projection live in `shared/embedding.py` and `shared/emotional.py`. Progeny owns cognitive reads (retrieval, rehydration, state recovery). Falcon has one write path (inbound dialogue) and one key-lookup read path (outbound response text).
+4. **Keys over the wire** — Progeny returns `utterance_key` (Qdrant point ID) instead of inline dialogue text. Falcon reads the text by key from Qdrant for wire formatting. Falls back to inline `utterance` for backward compat (stub mode, tests). Actions and actor_value_deltas still travel inline — only the dialogue text moves to Qdrant.
 5. **Emotional vectors as cognitive architecture** — Harmonics basis vectors stored as Qdrant vector keys. Memory retrieval = emotional resonance. Core innovation.
 6. **Forward-hold credit assignment** — No backpropagation. Emotional state held forward. Threshold crossings trigger storage and arc detection.
 7. **Dual-vector collections** — Each memory point has `semantic` + `emotional` named vectors. Retrieval blends both via Qdrant RRF fusion.

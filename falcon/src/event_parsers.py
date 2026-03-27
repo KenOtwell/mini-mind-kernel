@@ -407,7 +407,7 @@ def parse_named_cell_static(data: str) -> Optional[dict]:
 # Dispatcher
 # ---------------------------------------------------------------------------
 
-_PARSERS: dict[str, object] = {
+_PARSERS: dict[str, callable] = {
     "_speech":            parse_speech,
     "addnpc":             parse_addnpc,
     "updatestats":        parse_updatestats,

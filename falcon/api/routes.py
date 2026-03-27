@@ -33,7 +33,8 @@ router = APIRouter()
 
 # SKSE polls with 'request' events. We queue Progeny results here.
 # Lost on restart (acceptable — next turn regenerates).
-_response_queue: deque[str] = deque()
+# Bounded: if SKSE stops polling, don't let memory grow unbounded.
+_response_queue: deque[str] = deque(maxlen=64)
 
 # Tick accumulator: initialised in startup(), torn down in shutdown().
 _tick_accumulator: Optional[TickAccumulator] = None
@@ -105,6 +106,18 @@ async def comm_endpoint(request: Request) -> Response:
             logger.info("Session reset (%s) — NPC registry cleared", parsed.event_type)
         else:
             logger.info("Session signal: %s", parsed.event_type)
+        # Forward session events to tick accumulator so Progeny gets
+        # visibility into session boundaries (rollback, diary, Dragon Break).
+        if _tick_accumulator is not None:
+            event = TypedEvent(
+                event_type=parsed.event_type,
+                local_ts=datetime.now(timezone.utc).isoformat(),
+                game_ts=parsed.game_ts,
+                raw_data=parsed.data,
+                parsed_data=None,
+                is_turn_trigger=False,
+            )
+            await _tick_accumulator.push(event)
         return _empty()
 
     # --- All other events: decode structure, push to tick accumulator ---
@@ -170,10 +183,6 @@ async def _decode_skse_request(request: Request) -> str:
         logger.debug("Using raw POST body (%d bytes)", len(body))
     return body
 
-
-def _get_profile(request: Request) -> str:
-    """Extract the CHIM profile name from the request query string."""
-    return request.query_params.get("profile", "")
 
 
 # ---------------------------------------------------------------------------

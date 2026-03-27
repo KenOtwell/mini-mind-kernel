@@ -14,7 +14,7 @@ from shared.config import settings
 @pytest.fixture(autouse=True)
 def _reset_embedding_state():
     """Reset the module-level model between tests."""
-    import progeny.src.embedding as mod
+    import shared.embedding as mod
     saved = mod._model
     yield
     mod._model = saved

@@ -10,7 +10,7 @@ from shared.constants import EMOTIONAL_DIM, EMOTIONAL_AXES
 @pytest.fixture(autouse=True)
 def _reset_projection_state():
     """Reset the module-level bases so each test starts clean."""
-    import progeny.src.emotional_projection as mod
+    import shared.emotional as mod
     saved = mod._bases
     mod._bases = None
     yield
@@ -19,13 +19,13 @@ def _reset_projection_state():
 
 class TestLoadBases:
     def test_loads_from_default_path(self):
-        from progeny.src.emotional_projection import load_bases, _bases, is_loaded
+        from progeny.src.emotional_projection import load_bases, is_loaded
         load_bases()
         assert is_loaded()
 
     def test_bases_shape(self):
         from progeny.src.emotional_projection import load_bases
-        import progeny.src.emotional_projection as mod
+        import shared.emotional as mod
         load_bases()
         assert mod._bases is not None
         assert mod._bases.shape == (8, 384)
@@ -33,7 +33,7 @@ class TestLoadBases:
     def test_bases_orthonormal(self):
         """GS bases should be orthonormal — dot products ~0 off-diagonal."""
         from progeny.src.emotional_projection import load_bases
-        import progeny.src.emotional_projection as mod
+        import shared.emotional as mod
         load_bases()
         dot = mod._bases @ mod._bases.T
         # Diagonal should be ~1.0
@@ -68,12 +68,12 @@ class TestProject:
 
     def test_known_direction(self):
         """A vector aligned with the fear basis should project high on fear."""
-        from progeny.src.emotional_projection import load_bases
-        import progeny.src.emotional_projection as mod
+        from progeny.src.emotional_projection import load_bases, project
+        import shared.emotional as mod
         load_bases()
         # Use the fear basis vector itself as input
         fear_basis = mod._bases[0].copy()
-        sem = mod.project(fear_basis)
+        sem = project(fear_basis)
         # Fear (axis 0) should be ~1.0 (it's a unit vector projected onto itself)
         assert sem[0] > 0.9
         # Other axes should be near zero (orthogonal)

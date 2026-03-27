@@ -171,7 +171,7 @@ def format_turn_response(responses: list[dict]) -> str:
         actions = resp.get("actions", [])
         # actor_value_deltas: {"Aggression": 2, "Confidence": 3, ...} (None values skipped)
         avd_raw = resp.get("actor_value_deltas") or {}
-        avd = {k: v for k, v in avd_raw.items() if v is not None} if avd_raw else {}
+        avd = {k: v for k, v in avd_raw.items() if v is not None}
         all_lines.extend(format_agent_responses(agent_id, utterance, actions, avd))
 
     return "".join(line.format() for line in all_lines)

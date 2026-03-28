@@ -6,11 +6,14 @@ Both services import from here. If it's not in this file,
 it's not part of the interface.
 
 Wire flow:
-  SKSE → Falcon → TickPackage → Progeny → TurnResponse | AckResponse → Falcon → SKSE
+  SKSE → Falcon → Qdrant wrapper (write + auto-embed) → signal Progeny
+  Progeny → Qdrant wrapper (write + auto-embed) → keys via HTTP → Falcon
+  Falcon → Qdrant (key lookup for response text) → SKSE wire format
 
-Falcon decodes structure (event_parsers.py) and ships typed TickPackages.
-Progeny owns ALL semantic interpretation, embedding, emotional computation,
-memory retrieval, LLM interaction, and ALL Qdrant writes.
+Both services write through the same Qdrant enrichment wrapper
+(text in → auto-embed 384d semantic + 9d emotional → store → return key).
+Progeny owns cognitive work: emotional deltas, retrieval, scheduling,
+prompting, LLM interaction. Shared emotional projection in shared/emotional.py.
 """
 from __future__ import annotations
 
@@ -368,9 +371,16 @@ class NewMemory(BaseModel):
 
 
 class AgentResponse(BaseModel):
-    """Response for a single agent from the LLM turn."""
+    """Response for a single agent from the LLM turn.
+
+    utterance_key: if set, the utterance text was written to Qdrant via
+    the enrichment wrapper and this is the point ID. Falcon reads the
+    text by key for wire formatting. Falls back to inline utterance if
+    utterance_key is None (backward compat, tests, stub mode).
+    """
     agent_id: str
     utterance: Optional[str] = None
+    utterance_key: Optional[str] = None
     actor_value_deltas: Optional[ActorValueDeltas] = None
     actions: list[ActionCommand] = Field(default_factory=list)
     updated_harmonics: Optional[UpdatedHarmonics] = None

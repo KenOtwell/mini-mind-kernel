@@ -20,7 +20,9 @@ from falcon.src.progeny_protocol import send_package
 from falcon.src.event_parsers import parse_typed_data
 from falcon.src.tick_accumulator import TickAccumulator
 from shared.schemas import TypedEvent, TickPackage, TurnResponse
+from shared.constants import COLLECTION_NPC_MEMORIES
 from shared.config import settings
+from shared import qdrant_wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +35,8 @@ router = APIRouter()
 
 # SKSE polls with 'request' events. We queue Progeny results here.
 # Lost on restart (acceptable — next turn regenerates).
-_response_queue: deque[str] = deque()
+# Bounded: if SKSE stops polling, don't let memory grow unbounded.
+_response_queue: deque[str] = deque(maxlen=64)
 
 # Tick accumulator: initialised in startup(), torn down in shutdown().
 _tick_accumulator: Optional[TickAccumulator] = None
@@ -105,6 +108,18 @@ async def comm_endpoint(request: Request) -> Response:
             logger.info("Session reset (%s) — NPC registry cleared", parsed.event_type)
         else:
             logger.info("Session signal: %s", parsed.event_type)
+        # Forward session events to tick accumulator so Progeny gets
+        # visibility into session boundaries (rollback, diary, Dragon Break).
+        if _tick_accumulator is not None:
+            event = TypedEvent(
+                event_type=parsed.event_type,
+                local_ts=datetime.now(timezone.utc).isoformat(),
+                game_ts=parsed.game_ts,
+                raw_data=parsed.data,
+                parsed_data=None,
+                is_turn_trigger=False,
+            )
+            await _tick_accumulator.push(event)
         return _empty()
 
     # --- All other events: decode structure, push to tick accumulator ---
@@ -171,21 +186,26 @@ async def _decode_skse_request(request: Request) -> str:
     return body
 
 
-def _get_profile(request: Request) -> str:
-    """Extract the CHIM profile name from the request query string."""
-    return request.query_params.get("profile", "")
-
 
 # ---------------------------------------------------------------------------
 # Tick processing
 # ---------------------------------------------------------------------------
 
 async def _process_tick(package: TickPackage) -> None:
-    """Send TickPackage to Progeny and queue any TurnResponse for SKSE polling."""
+    """Send TickPackage to Progeny and queue any TurnResponse for SKSE polling.
+
+    Outbound path: if Progeny returns utterance_key (Qdrant point ID)
+    instead of inline utterance text, Falcon reads the text from Qdrant
+    by key before formatting to wire. Falls back to inline utterance
+    for backward compat (stub mode, tests).
+    """
     try:
         result = await send_package(package)
 
         if result and isinstance(result, TurnResponse) and result.responses:
+            # Resolve any utterance_key references to inline text
+            await _resolve_utterance_keys(result)
+
             wire_output = format_turn_response(
                 [r.model_dump() for r in result.responses]
             )
@@ -198,6 +218,31 @@ async def _process_tick(package: TickPackage) -> None:
 
     except Exception:
         logger.exception("Failed to process tick package")
+
+
+async def _resolve_utterance_keys(turn: TurnResponse) -> None:
+    """Resolve utterance_key → inline utterance text via Qdrant read.
+
+    For each AgentResponse that has utterance_key but no utterance,
+    read the text from Qdrant and set it inline. Wire formatting
+    only sees utterance text — keys are transparent at this layer.
+    """
+    from falcon.api.server import qdrant_client
+    if qdrant_client is None:
+        return
+
+    for resp in turn.responses:
+        if resp.utterance_key and not resp.utterance:
+            text = await qdrant_wrapper.read_text(
+                qdrant_client, COLLECTION_NPC_MEMORIES, resp.utterance_key,
+            )
+            if text:
+                resp.utterance = text
+            else:
+                logger.warning(
+                    "Failed to resolve utterance_key %s for %s",
+                    resp.utterance_key, resp.agent_id,
+                )
 
 
 # ---------------------------------------------------------------------------

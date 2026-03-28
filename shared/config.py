@@ -65,7 +65,7 @@ class ProgenyConfig:
 
 @dataclass
 class EmbeddingConfig:
-    """Embedding model settings (Progeny, CPU on Beelink). Not used by Falcon."""
+    """Embedding model settings. Used by both Falcon and Progeny via shared modules."""
     model_name: str = "all-MiniLM-L6-v2"
     device: str = "cpu"
     semantic_dim: int = 384

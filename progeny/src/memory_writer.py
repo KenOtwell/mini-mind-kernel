@@ -1,5 +1,5 @@
 """
-Memory writer — single write authority for all Qdrant tiers.
+Memory writer — Qdrant write operations for all tiers.
 
 Writes RAW events (immutable, every event), MOD arc summaries (on snap
 threshold crossings), and MAX compressed essences (operational compaction).
@@ -7,7 +7,14 @@ threshold crossings), and MAX compressed essences (operational compaction).
 Every write attaches both semantic and emotional vectors. The emotional
 vector IS the retrieval key for mood-congruent recall — not a side channel.
 
-See living doc §Memory Architecture and §Storage Trigger.
+NOTE: These methods currently accept pre-computed vectors. Under the
+new architecture, RAW writes for inbound dialogue and LLM responses
+will flow through the shared Qdrant enrichment wrapper (text in →
+auto-embed → store → key out), which calls these methods internally.
+MOD/MAX writes remain direct (they produce their own vectors from
+compression/distillation).
+
+See living doc §Memory Architecture, §Storage Trigger, §Qdrant Access Patterns.
 """
 from __future__ import annotations
 

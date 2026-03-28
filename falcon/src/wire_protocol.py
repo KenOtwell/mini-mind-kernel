@@ -111,13 +111,20 @@ def format_action(npc_name: str, command: str,
     return WireResponse(npc_name=npc_name, response_type="command", content=action_str)
 
 
-def format_agent_responses(agent_id: str,
-                           utterance: Optional[str],
-                           actions: list[dict]) -> list[WireResponse]:
+def format_agent_responses(
+    agent_id: str,
+    utterance: Optional[str],
+    actions: list[dict],
+    actor_value_deltas: Optional[dict] = None,
+) -> list[WireResponse]:
     """
     Convert one agent's response into CHIM wire lines.
 
-    Dialogue first, then actions. Unknown commands are silently dropped.
+    Order: dialogue, then explicit actions, then actor value deltas.
+    Actor value deltas are emitted as SetBehavior commands:
+        NPCName|command|SetBehavior@Aggression@2
+    These are handled in-game by MMKSetBehavior.psc via CHIM_CommandReceived.
+    Unknown commands are silently dropped.
     """
     lines: list[WireResponse] = []
 
@@ -135,6 +142,17 @@ def format_agent_responses(agent_id: str,
             item=action.get("item", "") or "",
         ))
 
+    # Actor value deltas — emit as SetBehavior@ValueName@NewValue
+    # The DLL forwards these via CHIM_CommandReceived to MMKSetBehavior.psc
+    if actor_value_deltas:
+        for value_name, new_value in actor_value_deltas.items():
+            if new_value is not None:
+                lines.append(format_action(
+                    agent_id, "SetBehavior",
+                    target=value_name,
+                    item=str(new_value),
+                ))
+
     return lines
 
 
@@ -144,12 +162,16 @@ def format_turn_response(responses: list[dict]) -> str:
 
     Input: list of AgentResponse dicts (from TurnResponse.responses).
     Output: multi-line string ready to return to SKSE plugin.
+    Includes actor_value_deltas as SetBehavior commands.
     """
     all_lines: list[WireResponse] = []
     for resp in responses:
         agent_id = resp.get("agent_id", "Unknown")
         utterance = resp.get("utterance")
         actions = resp.get("actions", [])
-        all_lines.extend(format_agent_responses(agent_id, utterance, actions))
+        # actor_value_deltas: {"Aggression": 2, "Confidence": 3, ...} (None values skipped)
+        avd_raw = resp.get("actor_value_deltas") or {}
+        avd = {k: v for k, v in avd_raw.items() if v is not None}
+        all_lines.extend(format_agent_responses(agent_id, utterance, actions, avd))
 
     return "".join(line.format() for line in all_lines)

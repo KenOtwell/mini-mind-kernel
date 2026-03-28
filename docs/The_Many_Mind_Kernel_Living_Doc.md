@@ -1687,6 +1687,38 @@ Source: clone `abeiro/HerikaServer`, extract from `data/` directory and PHP arra
 * Progeny deployment: Python virtualenv + `many-mind-kernel/progeny/` + Ollama
 * Connection config in `shared/config.py`: Qdrant host/port, Ollama host/port
 
+## Papyrus Build Toolchain
+
+Compiling custom Papyrus scripts (`.psc` → `.pex`) for the CHIM integration. Documented March 2026 after debugging the full import chain.
+
+**Compiler**: `"C:\Program Files (x86)\Steam\steamapps\common\Skyrim Special Edition\Papyrus Compiler\PapyrusCompiler.exe"`
+
+**Flags file**: `TESV_Papyrus_Flags.flg` (resolved from import paths)
+
+**Import paths** (order matters — first match wins for overlapping script names):
+1. **Target script directory** — must be in the import list or the compiler can't locate its own input
+2. **CHIM scripts** — `C:\Users\Ken\Projects\AIAgent-Chim\AIAgent\Source\Scripts` (provides `AIAgentFunctions.psc` and other CHIM-specific types)
+3. **SKSE scripts** — `C:\Modlists\PandasSovngarde\mods\Skyrim Script Extender for VR (SKSEVR)\Scripts\Source` (64 scripts including `StringUtil.psc`, `ModEvent.psc`, and SKSE-extended `Form.psc`, `Actor.psc`, etc.)
+4. **Vanilla Skyrim base scripts** — `C:\Program Files (x86)\Steam\steamapps\common\Skyrim Special Edition\Data\Source\Scripts`
+
+**Critical: SKSE must come BEFORE vanilla base scripts.** SKSE provides extended versions of vanilla scripts (e.g., `Form.psc` with `RegisterForModEvent`, `Actor.psc` with SKSE-added functions). If vanilla is imported first, the compiler resolves the vanilla `Form.psc` and reports SKSE functions as undefined.
+
+**SKSE source location**: The SKSE Papyrus sources are NOT installed by default — they come bundled in the SKSE download archive and must be extracted to a `Scripts\Source` folder. On this machine, the only copy lives inside the Wabbajack-installed Panda's Sovngarde modlist at the path above. They are from SKSEVR but are compatible with SE compilation (identical Papyrus function signatures).
+
+**Example compile command** (PowerShell):
+```
+& "C:\Program Files (x86)\Steam\steamapps\common\Skyrim Special Edition\Papyrus Compiler\PapyrusCompiler.exe" `
+  "<path>\MMKSetBehavior.psc" `
+  -f="TESV_Papyrus_Flags.flg" `
+  -i="<script_dir>;C:\Users\Ken\Projects\AIAgent-Chim\AIAgent\Source\Scripts;C:\Modlists\PandasSovngarde\mods\Skyrim Script Extender for VR (SKSEVR)\Scripts\Source;C:\Program Files (x86)\Steam\steamapps\common\Skyrim Special Edition\Data\Source\Scripts" `
+  -o="<output_dir>"
+```
+
+**Compiled artifacts**: `.pex` files go into `Data\Scripts` in the Skyrim install (or equivalent mod manager virtual folder). Attach to a persistent autostart Quest in Creation Kit.
+
+**MMK scripts** (source in `docs/AIAgent/.../Source/Scripts/`):
+* `MMKSetBehavior.psc` — Receives `SetBehavior` commands from Falcon via CHIM's `CHIM_CommandReceived` ModEvent. Parses `Aggression@2` format, applies `SetActorValue` to the target NPC. Dependencies: SKSE (`RegisterForModEvent`, `StringUtil`), CHIM (`AIAgentFunctions.getAgentByName`).
+
 ## Open Design Questions
 
 * **Threshold tuning** — What delta magnitude = "significant" emotional shift? Likely needs per-agent calibration based on harmonic buffer decay rates.

@@ -1008,6 +1008,7 @@ The system has no "combat mode" flag. Curvature and snap — the 1st and 2nd der
 * SKSE polls via `request` events at POLINT intervals (default 1s). Falcon handles `request` locally from its response queue — never involves Progeny for polling.
 * Falcon's tick interval (~1-3 seconds) is independent of POLINT — it ships typed event packages to Progeny on its own cadence.
 * Progeny returns response bundles when ready (LLM inference may span multiple Falcon ticks). Falcon enqueues and serves on next `request` poll.
+* **Current implementation gap**: Falcon's `send_package()` blocks the tick loop awaiting Progeny's HTTP response. During LLM generation (3-6s), no ticks fire and events accumulate silently. Target architecture: fire-and-forget delivery + async response callback. See Pipelined Prompt Construction below.
 
 **Concrete async handoff (ambush example):**
 * Tick 1: Ambush. SKSE sends `info` events. Falcon structurally parses them, accumulates in buffer.
@@ -1018,6 +1019,80 @@ The system has no "combat mode" flag. Curvature and snap — the 1st and 2nd der
 * Tick 6: SKSE sends `request`. Falcon dequeues: actor value deltas (Aggression→2, Confidence→3) + combat bark ("I've got this!"). NPC's engine behavior shifts — fights more aggressively, holds ground instead of retreating. Mind caught up to the body.
 
 The game engine never blocks. The LLM's 3-6 second OODA loop plays out across POLINT ticks while the NPC fights on reflexes. Falcon's only role was packaging and delivery — all the snap computation, context stashing, and prompt shaping happened on Progeny.
+
+### Pipelined Prompt Construction
+
+*Insight documented March 2026. Lineage: Ken Ong (architecture), Oz/Warp (mechanism).*
+
+**The problem with sequential processing:**
+In a naïve implementation, Progeny processes each turn as a serial chain: receive events → build prompt (embed, project, retrieve, format) → run LLM → parse response → ship to Falcon. Prompt construction takes 1-2 seconds (embedding, Qdrant retrieval, memory bundling, JSON assembly). LLM generation takes 3-6 seconds. Total per-turn latency: 4-8 seconds. During generation, Progeny does nothing — 8 Zen 5 cores idle while the LLM grinds tokens.
+
+Worse: if Falcon blocks its tick loop awaiting Progeny's HTTP response (the current `send_package()` pattern), events accumulate silently and Progeny goes blind during the generation window.
+
+**The pipeline: separate context management from LLM execution.**
+
+Prompt construction and LLM generation use *different resources*. Prompt construction is CPU work (embedding text, projecting 9d, querying Qdrant, formatting JSON). LLM generation is inference work (dedicated cores or NPU on the Beelink). They can overlap.
+
+Three concurrent stages on Beelink's 8 Zen 5 cores:
+
+```
+Stage A (CPU, continuous):   Accumulate events from Falcon, compute emotional deltas,
+                             update harmonic buffers, run retrieval, incrementally
+                             build prompt N+1 as events arrive.
+
+Stage B (LLM cores):         Generate response N (3-6 seconds, token by token).
+
+Stage C (CPU, on completion): Parse response N, write utterance to Qdrant via wrapper,
+                              ship response keys to Falcon, feed LLM output text back
+                              through emotional delta pipeline (bidirectional).
+```
+
+**The critical overlap:** While Stage B generates response N, Stage A is already building prompt N+1 from incoming events. Embedding, projection, Qdrant retrieval, memory bundling, harmonic buffer updates, scheduler tier assignments, curvature-driven truncation decisions — all happen *during* the generation window, not after it.
+
+**The splice point:** When Stage B completes response N:
+1. Stage C ships the result to Falcon (fire-and-forget, non-blocking)
+2. Stage C feeds the LLM's own utterance through the emotional delta pipeline (bidirectional — the agent's words shift its own harmonic state, per the Emotional Architecture)
+3. Stage A splices the output delta and the agent's own utterance context into the in-progress prompt N+1
+4. Prompt N+1 is already ~95% built — the splice adds the LLM's self-referential update (~50ms)
+5. **Fire LLM N+1 immediately**
+
+**Latency savings:**
+* Sequential: `build(1-2s) + generate(3-6s) + parse(~100ms)` = **4-8 seconds per turn**
+* Pipelined: `generate(3-6s) + splice(~50ms)` = **3-6 seconds per turn** (prompt was pre-built)
+* The 1-2 seconds of prompt construction overhead is *eliminated* from the critical path — it runs in parallel with the previous generation
+* Over a 10-minute play session (~100-200 turns), this saves 2-6 minutes of cumulative latency
+
+**What Falcon must change:**
+* **Fire-and-forget tick delivery.** `send_package()` ships the TickPackage and returns immediately (non-blocking). The tick loop never stalls.
+* **Async response callback.** Progeny delivers results to Falcon via a POST to a Falcon callback endpoint (e.g., `POST /response`) or Falcon polls a Progeny response queue. Either way, the tick loop and response delivery are decoupled.
+* Events flow continuously from Falcon to Progeny on tick cadence. Responses flow back asynchronously when ready. The two streams are independent.
+
+**What Progeny must change:**
+* **Separate the context manager from the LLM executor.** Two concurrent subsystems:
+    * `context_manager` (CPU) — receives events from Falcon, runs the emotional delta pipeline, updates harmonic buffers, queries Qdrant, incrementally builds the next prompt. Runs continuously, never blocks on LLM.
+    * `llm_executor` (LLM cores) — receives a finalized prompt, generates, returns raw response text. Runs one generation at a time.
+* `context_manager` maintains a **staging prompt** — the in-progress prompt for the next turn. As events arrive and are processed, the staging prompt is updated incrementally (new events appended to state_history, memory bundles refreshed, scheduler tiers recalculated).
+* When `llm_executor` finishes: `context_manager` receives the output, runs it through the delta pipeline, splices the self-referential update into the staging prompt, finalizes it, and hands it to `llm_executor` for the next generation.
+* The staging prompt is a *living document* that reflects the world as of right now, not as of when the last LLM call started.
+
+**Interaction with curvature-driven truncation:**
+Because the staging prompt is built incrementally, a snap spike that arrives *during* generation can reshape the prompt for the NEXT turn in real time. If an ambush happens while the LLM is generating a calm conversation response:
+1. The calm response finishes and ships (it was correct when prompted)
+2. But the staging prompt for N+1 was already truncated by the snap spike — it reflects the ambush
+3. The next LLM call fires immediately with the combat-focused prompt
+4. The NPC's behavioral shift arrives one generation-window faster than in the sequential model
+
+**Interaction with Many-Mind Scheduling:**
+Tier assignments are recomputed continuously by the context manager as NPC positions, curvature values, and collaboration states change. If an NPC's curvature spikes during generation (curvature-driven tier promotion), they're already promoted in the staging prompt before the next LLM call fires. The scheduler doesn't wait for the LLM to finish to notice the world changed.
+
+**Turn-boundary dissolution:**
+The LLM's own output enters the event stream at the same level as world events from Falcon. The context manager doesn't distinguish "my words" from "world events" — they're all deltas through the same pipeline, processed concurrently into the staging prompt. The NPC finishes saying "I think we should—" and in the same processing window, Falcon events arrive: an enemy flanking, the player drawing a weapon, a companion shouting. All events (including the NPC's own interrupted sentence) flow through the delta pipeline together. The staging prompt reflects all of them simultaneously. There is no artificial chat turn. The NPC reacts to the world as it speaks, the same way a person adjusts mid-sentence when the situation changes. The turn boundary dissolves because the architecture has no turn boundary — just a continuous event stream with a generation pipeline running over it.
+
+**Why this works on 8 cores:**
+* LLM inference on the Beelink (llama.cpp or Ollama) can be pinned to a core subset (e.g., cores 4-7)
+* Context manager work (embedding, Qdrant I/O, buffer math) runs on remaining cores (0-3)
+* Python asyncio handles the event-driven coordination; heavy compute (embedding, projection) uses the sentence-transformers thread pool
+* The pipeline naturally load-balances: during generation, CPU cores do context work; during splice, all cores briefly coordinate; between turns, LLM cores idle while context catches up
 
 ### Urgency Signal
 

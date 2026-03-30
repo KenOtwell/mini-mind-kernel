@@ -1,6 +1,7 @@
 """Direct WebSocket round-trip test: bypass Falcon, talk to Progeny."""
 import asyncio
 import json
+from uuid import uuid4
 import websockets
 
 async def test():
@@ -24,7 +25,7 @@ async def test():
         "has_turn_trigger": True,
         "tick_interval_ms": 2000,
         "active_npc_ids": ["Lydia"],
-        "tick_id": "ws-test-001",
+        "tick_id": str(uuid4()),
     }})
 
     await ws.send(frame)

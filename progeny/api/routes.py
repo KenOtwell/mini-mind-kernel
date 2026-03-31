@@ -359,6 +359,24 @@ async def ws_channel(websocket: WebSocket) -> None:
     """
     await websocket.accept()
     logger.info("Falcon WebSocket connected")
+
+    async def _process_and_respond(pkg: TickPackage) -> None:
+        """Run ingest in background and send result back over WebSocket."""
+        try:
+            result = await ingest(pkg)
+            if isinstance(result, TurnResponse):
+                await websocket.send_text(json.dumps({
+                    "type": "turn_response",
+                    "data": result.model_dump(mode="json"),
+                }))
+            else:
+                await websocket.send_text(json.dumps({
+                    "type": "ack",
+                    "data": result.model_dump(mode="json"),
+                }))
+        except Exception:
+            logger.exception("Error processing tick in background")
+
     try:
         while True:
             raw = await websocket.receive_text()
@@ -373,18 +391,10 @@ async def ws_channel(websocket: WebSocket) -> None:
                 continue
 
             package = TickPackage.model_validate(frame["data"])
-            result = await ingest(package)
-
-            if isinstance(result, TurnResponse):
-                await websocket.send_text(json.dumps({
-                    "type": "turn_response",
-                    "data": result.model_dump(mode="json"),
-                }))
-            else:
-                await websocket.send_text(json.dumps({
-                    "type": "ack",
-                    "data": result.model_dump(mode="json"),
-                }))
+            # Fire-and-forget: process tick in background so the read loop
+            # stays responsive. Data-only ticks return instantly (ack).
+            # Turn triggers run LLM generation (~12s) without blocking reads.
+            asyncio.create_task(_process_and_respond(package))
     except WebSocketDisconnect:
         logger.info("Falcon WebSocket disconnected")
     except Exception:

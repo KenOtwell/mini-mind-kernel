@@ -69,6 +69,9 @@ _FENCE_RE = re.compile(
 # Trailing commas before } or ] — common LLM mistake
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 
+# Line comments (// ...) inside JSON — Mistral and other models do this
+_LINE_COMMENT_RE = re.compile(r"\s*//[^\n]*")
+
 
 def _repair_llm_output(raw: str) -> str:
     """
@@ -85,6 +88,9 @@ def _repair_llm_output(raw: str) -> str:
     fence_match = _FENCE_RE.search(text)
     if fence_match:
         text = fence_match.group(1).strip()
+
+    # Strip // line comments (LLMs like Mistral add these to JSON)
+    text = _LINE_COMMENT_RE.sub("", text)
 
     # Fix trailing commas
     text = _TRAILING_COMMA_RE.sub(r"\1", text)
@@ -140,8 +146,8 @@ def _parse_agent_entry(entry: dict[str, Any]) -> AgentResponse:
     """Parse a single agent response entry from the LLM JSON."""
     agent_id = entry.get("agent_id", "unknown")
 
-    # Utterance
-    utterance = entry.get("utterance")
+    # Utterance — LLM may use "utterance" (Tier 0) or "brief_utterance" (lower tiers)
+    utterance = entry.get("utterance") or entry.get("brief_utterance")
     if utterance is not None:
         utterance = str(utterance).strip() or None
 

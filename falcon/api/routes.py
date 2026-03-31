@@ -66,8 +66,8 @@ async def shutdown() -> None:
 # SKSE compatibility endpoint
 # ---------------------------------------------------------------------------
 
-@router.post("/comm.php")
-@router.post("/{path:path}")  # Catch configurable AIAgent.ini paths
+@router.api_route("/comm.php", methods=["GET", "POST"])
+@router.api_route("/{path:path}", methods=["GET", "POST"])  # Catch configurable AIAgent.ini paths
 async def comm_endpoint(request: Request) -> Response:
     """
     SKSE compatibility endpoint.

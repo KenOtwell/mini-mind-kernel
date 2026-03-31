@@ -1,8 +1,8 @@
 """
 Falcon API routes.
 
-POST /comm.php — SKSE compatibility endpoint (the main interface)
-GET  /health   — service health check
+GET|POST /comm.php — SKSE compatibility endpoint (the main interface)
+GET      /health   — service health check
 """
 from __future__ import annotations
 
@@ -66,16 +66,41 @@ async def shutdown() -> None:
 # SKSE compatibility endpoint
 # ---------------------------------------------------------------------------
 
+@router.get("/health")
+async def health():
+    """Health check — Falcon service status. Registered before catch-all."""
+    active_npcs = _tick_accumulator.get_active_npc_count() if _tick_accumulator else 0
+    return {
+        "status": "ok",
+        "service": "falcon",
+        "progeny_ws": settings.progeny.ws_url,
+        "ws_connected": progeny_protocol._ws is not None,
+        "queue_depth": len(_response_queue),
+        "active_npcs": active_npcs,
+        "tick_interval_s": settings.falcon.tick_interval_seconds,
+    }
+
+
 @router.api_route("/comm.php", methods=["GET", "POST"])
-@router.api_route("/{path:path}", methods=["GET", "POST"])  # Catch configurable AIAgent.ini paths
 async def comm_endpoint(request: Request) -> Response:
     """
     SKSE compatibility endpoint.
 
-    Accepts base64-encoded pipe-delimited wire format in query string
-    (?DATA=<base64>&profile=<name>), returns CHIM wire format.
-    This is the entry point that replaces HerikaServer's comm.php.
+    The DLL sends base64-encoded data as GET query params:
+        GET /comm.php?DATA=<base64>&profile=<name>
+    Also accepts POST for forward compatibility and testing.
     """
+    return await _handle_skse_request(request)
+
+
+@router.api_route("/{path:path}", methods=["GET", "POST"])
+async def comm_endpoint_catchall(request: Request) -> Response:
+    """Catch-all for all other CHIM DLL paths (gamedata.php, streamv2.php, etc.)."""
+    return await _handle_skse_request(request)
+
+
+async def _handle_skse_request(request: Request) -> Response:
+    """Shared SKSE request handler for all comm endpoints."""
     raw_body = await _decode_skse_request(request)
     parsed = parse_event(raw_body)
 
@@ -272,19 +297,3 @@ def _empty() -> Response:
     return Response(content="", media_type="text/plain")
 
 
-# ---------------------------------------------------------------------------
-# Health / debug
-# ---------------------------------------------------------------------------
-
-@router.get("/health")
-async def health():
-    """Health check — Falcon service status."""
-    active_npcs = _tick_accumulator.get_active_npc_count() if _tick_accumulator else 0
-    return {
-        "status": "ok",
-        "service": "falcon",
-        "progeny_url": settings.progeny.base_url,
-        "queue_depth": len(_response_queue),
-        "active_npcs": active_npcs,
-        "tick_interval_s": settings.falcon.tick_interval_seconds,
-    }

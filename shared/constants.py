@@ -49,7 +49,8 @@ ACTOR_VALUE_RANGES: dict[str, tuple[int, int, str]] = {
 # Player input event types — Progeny uses these to identify player speech
 # among accumulated events and decide when to respond. This is a semantic
 # label for event classification, not a flow-control gate.
-PLAYER_INPUT_TYPES: frozenset[str] = frozenset({"inputtext", "inputtext_s"})
+# ginputtext = voice-transcribed input from CHIM open mic (STT result).
+PLAYER_INPUT_TYPES: frozenset[str] = frozenset({"inputtext", "inputtext_s", "ginputtext"})
 
 # Events handled locally by Falcon
 # request  : SKSE polls for queued responses — dequeue from local response queue.

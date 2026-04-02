@@ -2,6 +2,7 @@
 Falcon API routes.
 
 GET|POST /comm.php — SKSE compatibility endpoint (the main interface)
+GET|POST /stt.php  — speech-to-text endpoint (CHIM open mic audio)
 GET      /health   — service health check
 """
 from __future__ import annotations
@@ -91,6 +92,50 @@ async def comm_endpoint(request: Request) -> Response:
     Also accepts POST for forward compatibility and testing.
     """
     return await _handle_skse_request(request)
+
+
+@router.api_route("/stt.php", methods=["GET", "POST"])
+async def stt_endpoint(request: Request) -> Response:
+    """
+    Speech-to-text endpoint for CHIM open mic.
+
+    CHIM may send audio as raw POST body or as multipart form upload.
+    Returns transcribed text as plain text (what CHIM expects).
+    """
+    from falcon.src.stt import transcribe
+
+    content_type = request.headers.get("content-type", "")
+    logger.info("STT request: content-type=%s", content_type)
+
+    audio_bytes = None
+
+    # Try multipart form upload first (CHIM's HTTPUploader likely uses this)
+    if "multipart" in content_type:
+        form = await request.form()
+        for key in form:
+            upload = form[key]
+            if hasattr(upload, "read"):
+                audio_bytes = await upload.read()
+                logger.info("STT: extracted %d bytes from multipart field '%s'", len(audio_bytes), key)
+                break
+
+    # Fall back to raw body
+    if audio_bytes is None:
+        audio_bytes = await request.body()
+        if audio_bytes:
+            logger.info("STT: using raw body (%d bytes)", len(audio_bytes))
+
+    if not audio_bytes:
+        logger.warning("STT: no audio data in request")
+        return Response(content="", media_type="text/plain")
+
+    try:
+        text = transcribe(audio_bytes)
+        logger.info("STT result: '%s' (%d bytes audio)", text[:80], len(audio_bytes))
+        return Response(content=text, media_type="text/plain")
+    except Exception:
+        logger.exception("STT transcription failed")
+        return Response(content="", media_type="text/plain")
 
 
 @router.api_route("/{path:path}", methods=["GET", "POST"])

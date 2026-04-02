@@ -233,6 +233,10 @@ class TypedEvent(BaseModel):
     structurally decoded form based on event_type (populated by
     event_parsers.py for known types; None for unrecognised types).
     Progeny does all semantic interpretation — Falcon only decodes structure.
+    request_profile preserves CHIM's opaque `profile` query parameter
+    (frequently an MD5-backed profile key rather than a display name).
+    request_path preserves the original HTTP path (`/comm.php`,
+    `/streamv2.php`, etc.) for transport compatibility and debugging.
     """
     event_type: str          # Lowercased verbatim from wire
     local_ts: str
@@ -240,6 +244,8 @@ class TypedEvent(BaseModel):
     raw_data: str
     parsed_data: Optional[dict] = None   # Type-specific structural decode
     is_turn_trigger: bool = False
+    request_profile: Optional[str] = None
+    request_path: Optional[str] = None
 
 
 class TickPackage(BaseModel):

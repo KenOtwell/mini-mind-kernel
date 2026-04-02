@@ -101,15 +101,22 @@ async def comm_endpoint_catchall(request: Request) -> Response:
 
 async def _handle_skse_request(request: Request) -> Response:
     """Shared SKSE request handler for all comm endpoints."""
+    request_profile = request.query_params.get("profile")
+    request_path = request.url.path
     raw_body = await _decode_skse_request(request)
     parsed = parse_event(raw_body)
 
     if parsed is None:
         return _empty()
 
-    logger.debug("SKSE event: type=%s game_ts=%.1f trigger=%s local=%s",
-                 parsed.event_type, parsed.game_ts,
-                 parsed.is_turn_trigger, parsed.is_local)
+    # Diagnostic: log every non-polling event at INFO so addnpc/init visibility
+    # is guaranteed regardless of log level.  request events are too frequent.
+    if parsed.event_type != "request":
+        logger.info("SKSE event: path=%s type=%s game_ts=%.1f trigger=%s session=%s profile=%s",
+                    request_path, parsed.event_type, parsed.game_ts,
+                    parsed.is_turn_trigger, parsed.is_session, request_profile)
+    else:
+        logger.debug("SKSE poll: request")
 
     # --- SKSE polling for response ---
     if parsed.event_type == "request":
@@ -143,19 +150,32 @@ async def _handle_skse_request(request: Request) -> Response:
                 raw_data=parsed.data,
                 parsed_data=None,
                 is_turn_trigger=False,
+                request_profile=request_profile,
+                request_path=request_path,
             )
             await _tick_accumulator.push(event)
         return _empty()
 
     # --- All other events: decode structure, push to tick accumulator ---
     if _tick_accumulator is not None:
+        parsed_data = parse_typed_data(parsed.event_type, parsed.data)
+
+        # Diagnostic: log addnpc parse results at INFO level
+        if parsed.event_type.startswith("addnpc"):
+            npc_name = parsed_data.get("name") if parsed_data else None
+            logger.info("ADDNPC arrived: path=%s type=%s parsed=%s name=%s profile=%s data=%.120s",
+                        request_path, parsed.event_type, parsed_data is not None,
+                        npc_name, request_profile, parsed.data)
+
         event = TypedEvent(
             event_type=parsed.event_type,
             local_ts=datetime.now(timezone.utc).isoformat(),
             game_ts=parsed.game_ts,
             raw_data=parsed.data,
-            parsed_data=parse_typed_data(parsed.event_type, parsed.data),
+            parsed_data=parsed_data,
             is_turn_trigger=parsed.is_turn_trigger,
+            request_profile=request_profile,
+            request_path=request_path,
         )
         await _tick_accumulator.push(event)
     else:

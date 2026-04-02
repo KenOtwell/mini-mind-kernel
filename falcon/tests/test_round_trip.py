@@ -15,7 +15,7 @@ from scripts.stub_progeny import app as stub_app
 from shared.schemas import TickPackage, TurnResponse, AckResponse, AgentResponse, ExtractionLevel
 from tests.fixtures.factories import (
     WIRE_INPUTTEXT, WIRE_INFO, WIRE_REQUEST, WIRE_GOODNIGHT, WIRE_CHATNF,
-    WIRE_MALFORMED_EMPTY, WIRE_DATA_WITH_PIPES,
+    WIRE_MALFORMED_EMPTY, WIRE_DATA_WITH_PIPES, WIRE_CHAT,
     make_turn_package,
 )
 
@@ -127,6 +127,45 @@ class TestFalconEndpoint:
             resp = await client.post("/comm.php", content=WIRE_REQUEST)
             assert resp.status_code == 200
             assert resp.text == ""
+
+    @pytest.mark.anyio
+    async def test_chat_event_preserves_request_profile_and_path(self):
+        """Forwarded events should retain CHIM query metadata and catch-all path."""
+        from falcon.api import routes
+
+        class Recorder:
+            def __init__(self):
+                self.events = []
+
+            async def push(self, event):
+                self.events.append(event)
+
+        recorder = Recorder()
+        old_accumulator = routes._tick_accumulator
+        routes._tick_accumulator = recorder
+        try:
+            b64_data = base64.b64encode(WIRE_CHAT.encode()).decode()
+            async with AsyncClient(
+                transport=ASGITransport(app=falcon_app),
+                base_url="http://test",
+            ) as client:
+                resp = await client.post(
+                    "/streamv2.php?DATA={}&profile=5e409e09f43d85c6e61301149e4f803b".format(b64_data)
+                )
+                assert resp.status_code == 200
+                assert resp.text == ""
+
+            assert len(recorder.events) == 1
+            event = recorder.events[0]
+            assert event.event_type == "chat"
+            assert event.request_profile == "5e409e09f43d85c6e61301149e4f803b"
+            assert event.request_path == "/streamv2.php"
+            assert event.parsed_data is not None
+            assert event.parsed_data["speaker"] == "Belethor"
+            assert event.parsed_data["listener"] == "Lydia"
+            assert event.parsed_data["speech"] == "Do come back"
+        finally:
+            routes._tick_accumulator = old_accumulator
 
 
 # ---------------------------------------------------------------------------

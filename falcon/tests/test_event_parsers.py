@@ -8,6 +8,7 @@ import pytest
 
 from falcon.src.event_parsers import (
     parse_speech,
+    parse_chat,
     parse_addnpc,
     parse_updatestats,
     parse_quest_json,
@@ -62,6 +63,29 @@ class TestParseSpeech:
 
     def test_empty_string_returns_none(self):
         assert parse_speech("") is None
+
+
+# ---------------------------------------------------------------------------
+# chat → ChatData-like dict
+# ---------------------------------------------------------------------------
+
+class TestParseChat:
+    def test_pipe_delimited_chat_payload(self):
+        result = parse_chat("Belethor|Lydia|Do come back")
+        assert result is not None
+        assert result["speaker"] == "Belethor"
+        assert result["listener"] == "Lydia"
+        assert result["speech"] == "Do come back"
+
+    def test_plaintext_chat_payload(self):
+        result = parse_chat("Do come back")
+        assert result is not None
+        assert result["speaker"] == ""
+        assert result["listener"] == ""
+        assert result["speech"] == "Do come back"
+
+    def test_empty_chat_returns_none(self):
+        assert parse_chat("") is None
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +308,13 @@ class TestParseTypedData:
         )
         assert result is not None
         assert result["listener"] == "Lydia"
+
+    def test_chat_dispatches(self):
+        result = parse_typed_data("chat", "Belethor|Lydia|Do come back")
+        assert result is not None
+        assert result["speaker"] == "Belethor"
+        assert result["listener"] == "Lydia"
+        assert result["speech"] == "Do come back"
 
     def test_addnpc_dispatches(self):
         result = parse_typed_data("addnpc", "Lydia")

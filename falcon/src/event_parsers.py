@@ -59,6 +59,43 @@ def parse_speech(data: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# chat → ChatData-like dict
+# ---------------------------------------------------------------------------
+
+def parse_chat(data: str) -> Optional[dict]:
+    """
+    chat → dict.
+
+    Common CHIM payload shape is:
+        speaker|listener|speech
+    but some paths may emit only plain dialogue text. Preserve whichever
+    structure is available without raising.
+    """
+    stripped = data.strip()
+    if not stripped:
+        return None
+
+    parts = stripped.split("|", 2)
+    if len(parts) == 3:
+        return {
+            "speaker": parts[0].strip(),
+            "listener": parts[1].strip(),
+            "speech": parts[2].strip(),
+        }
+    if len(parts) == 2:
+        return {
+            "speaker": parts[0].strip(),
+            "listener": "",
+            "speech": parts[1].strip(),
+        }
+    return {
+        "speaker": "",
+        "listener": "",
+        "speech": stripped,
+    }
+
+
+# ---------------------------------------------------------------------------
 # addnpc → NpcRegistration
 # ---------------------------------------------------------------------------
 
@@ -409,6 +446,7 @@ def parse_named_cell_static(data: str) -> Optional[dict]:
 
 _PARSERS: dict[str, callable] = {
     "_speech":            parse_speech,
+    "chat":               parse_chat,
     "addnpc":             parse_addnpc,
     "updatestats":        parse_updatestats,
     "_quest":             parse_quest_json,
@@ -423,9 +461,21 @@ _PARSERS: dict[str, callable] = {
 }
 
 
+# Event types that use prefix matching (mirrors HerikaServer's strpos dispatch).
+# Any event_type starting with one of these prefixes routes to the mapped parser.
+# See shared/constants.py note on prefix semantics.
+_PREFIX_PARSERS: list[tuple[str, callable]] = [
+    ("addnpc", parse_addnpc),
+]
+
+
 def parse_typed_data(event_type: str, raw_data: str) -> Optional[dict]:
     """
     Dispatch to the appropriate structural parser for event_type.
+
+    Checks exact-match parsers first, then falls back to prefix-match
+    parsers (mirrors HerikaServer's strpos-based dispatch for event types
+    like addnpc and info*).
 
     Returns a serialisable dict or None if:
       - No parser is registered for this event type (most types have none —
@@ -435,6 +485,12 @@ def parse_typed_data(event_type: str, raw_data: str) -> Optional[dict]:
     Never raises.
     """
     parser = _PARSERS.get(event_type)
+    if parser is None:
+        # Prefix-match fallback for types like addnpc*, info*, etc.
+        for prefix, pfx_parser in _PREFIX_PARSERS:
+            if event_type.startswith(prefix):
+                parser = pfx_parser
+                break
     if parser is None:
         return None
     try:

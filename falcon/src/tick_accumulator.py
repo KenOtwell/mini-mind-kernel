@@ -65,20 +65,32 @@ class TickAccumulator:
         Push a TypedEvent into the buffer.
 
         Updates active_npc_ids when an addnpc event arrives with a parsed
-        NPC name.
+        NPC name.  Uses prefix matching (startswith) to mirror HerikaServer's
+        strpos-based dispatch — the DLL may send addnpc variants.
         """
         async with self._lock:
             self._buffer.append(event)
-            if event.event_type == "addnpc" and event.parsed_data:
+            if event.event_type.startswith("addnpc") and event.parsed_data:
                 npc_name = event.parsed_data.get("name")
                 if npc_name:
                     self._active_npc_ids.add(npc_name)
+                    logger.info("NPC registered: %s (active=%d)",
+                                npc_name, len(self._active_npc_ids))
+                else:
+                    logger.warning("addnpc event has parsed_data but no 'name' key: %s",
+                                   event.parsed_data)
+            elif event.event_type.startswith("addnpc"):
+                logger.warning("addnpc event arrived with parsed_data=None — "
+                               "parser may have failed. raw=%.120s",
+                               event.raw_data)
 
     async def clear_npcs(self) -> None:
         """Clear the NPC registry (called on init / wipe / playerdied)."""
         async with self._lock:
+            prev_count = len(self._active_npc_ids)
+            prev_names = list(self._active_npc_ids) if prev_count <= 10 else []
             self._active_npc_ids.clear()
-        logger.debug("NPC registry cleared")
+        logger.info("NPC registry cleared (was %d NPCs: %s)", prev_count, prev_names)
 
     def get_active_npc_count(self) -> int:
         """Best-effort sync count for the health endpoint (no lock taken)."""

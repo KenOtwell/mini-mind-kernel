@@ -221,8 +221,8 @@ class EventAccumulator:
         if event_type == "_speech" and "speaker" in parsed:
             return parsed["speaker"]
 
-        # NPC registration
-        if event_type == "addnpc" and "name" in parsed:
+        # NPC registration (prefix match — DLL may send addnpc variants)
+        if event_type.startswith("addnpc") and "name" in parsed:
             return parsed["name"]
 
         # Stats update

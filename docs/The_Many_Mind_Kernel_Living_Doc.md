@@ -612,11 +612,38 @@ This extends the Tuning Knobs Model (see Fast-Twitch / Slow-Twitch Decoupling) i
 
 Each memory point stores TWO named vectors in Qdrant:
 * `semantic` (384d, all-MiniLM) — *what* happened (text content embedding)
-* `emotional` (9d, harmonics basis) — *how it felt* (agent's emotional state at encoding time)
+* `emotional` (9d, harmonics basis) — the emotional **delta** at encoding time (*what changed*, not absolute state)
 
-Similarity search on the emotional vector = **mood-congruent memory recall**: agents remember sad things when sad, not because of rules, but because the vector geometry makes it so. This is a real cognitive phenomenon (Bower 1981) emerging from data structure alone.
+**Why the delta, not the absolute state:** The delta captures novelty — the surprise, the causal information, the thing that makes this event worth remembering. Storing absolute state means retrieval finds "times when I felt like this." Storing the delta means retrieval finds "times when *this kind of shift* happened." The delta is almost always the salient signal for causal reasoning: "I suddenly felt afraid" retrieves other sudden-fear events, while "I was afraid" retrieves everything that happened while afraid — swamping the signal with context.
+
+Similarity search on the emotional delta vector = **shift-congruent memory recall**: agents retrieve memories where similar kinds of emotional change occurred, not just similar emotional states. This produces "this feels like that time when..." associations based on the *shape* of the transition, not the *position* in emotional space.
 
 Retrieval blends both axes via Qdrant `prefetch` + `FusionQuery(RRF)`. Emotional intensity bias: high arousal shifts weight toward emotional axis, calm states bias toward semantic axis.
+
+### Arc Emotional Compression (MOD/MAX Tier Storage)
+
+*Documented 2026-04-05. Lineage: Ken Ong (delta storage, arc compression), Oz (tier design, aging schedule).*
+
+Arc summaries at MOD tier store emotional trajectory snapshots alongside the delta vector, enabling arc-shape matching — retrieval that finds memories with similar *experiential trajectories*, not just similar topics or endpoints.
+
+**MOD tier (fresh, < 30 days) — full emotional discrimination:**
+* `emotional` vector (9d): the delta (primary retrieval key)
+* `before_state` payload (9d): harmonic snapshot before the arc
+* `after_state` payload (9d): harmonic snapshot after resolution
+* Total: 27 floats (~108 bytes) for the emotional trajectory
+* Enables: "find arcs that started calm, got tense, and resolved with relief" — arc-shape matching
+* The `before_state` and `after_state` ride as payload, not named vectors — they support post-retrieval re-ranking, not primary search
+
+**MAX tier (aged, > 30 days) — valence-trajectory compression:**
+* Compress 9d → 3d: positive valence (love+excitement+joy+safety), negative valence (fear+anger+disgust+sadness), residual
+* `before_state` payload (3d) + `after_state` payload (3d)
+* Total: 6 floats (~24 bytes) for the compressed trajectory
+* Loses which specific emotion, keeps whether the arc went positive→negative, negative→positive, etc.
+* The compression mirrors human memory aging: old memories lose emotional specificity but retain whether something "went well" or "went badly"
+
+**Why before+after, not before+during+after:** The middle state is the least useful for retrieval. You mostly search for arcs by "how did it start?" (match current state to arc beginnings) or "how did it end?" (match desired resolution). The middle is texture — captured in the arc summary text, not needed for vector search.
+
+**Aging as natural compression:** The transition from MOD (9d×2) to MAX (3d×2) is the forgetting that makes memory sustainable. You don't decide which emotions to forget — the dimensionality reduction naturally preserves valence (the strongest signal) and drops tone (the subtlest). Same information-theoretic priority as the Gram-Schmidt ordering on the emotional bases.
 
 ### The Kryptonite Problem (Future Research)
 
@@ -713,6 +740,91 @@ Snap — not raw delta — is the event boundary detector. Curvature alone can't
 Only difference between significant and insignificant events: whether an arc summary gets generated. Raw data stores either way.
 
 **Compaction** is a separate operational concern — when raw point count impacts performance, promote old points RAW->MOD->MAX. Operational decision, not cognitive. Keep out of core loop.
+
+### Episodic Memory Store/Retrieve Cycle — The Reminding Protocol
+
+*Documented 2026-04-05. Lineage: Ken Ong (delta storage, anti-recursion design), Oz (cycle architecture, filter strategy).*
+
+A single, non-recursive cycle that stores episodic memories and retrieves involuntary associations ("remindings") without feedback loops. One Qdrant write, one Qdrant search, one-tick delay between retrieval and influence.
+
+**The Store (one write per arc):**
+
+When snap fires (event boundary detected):
+```
+Qdrant point:
+  semantic vector (384d): embed(arc_summary_text)
+  emotional vector (9d):  the DELTA (what changed, not absolute state)
+  payload:
+    agent_id
+    arc_start_ts, arc_end_ts
+    raw_point_ids[]          — pointers for rehydration
+    tier: "MOD"
+    before_state: [9d]       — harmonic snapshot before the arc
+    after_state: [9d]        — harmonic snapshot after resolution
+```
+
+One write. The delta is the primary emotional retrieval key. Before/after snapshots ride as payload for arc-shape re-ranking.
+
+**The Retrieve (remindings, not recall):**
+
+Retrieval is involuntary association — the current state *resonates* with stored deltas. Not a deliberate query.
+
+```
+QUERY:
+  emotional vector = current delta (what just shifted)
+  semantic vector  = current context embedding
+
+  FILTER (pre-search, via Qdrant must_not on point IDs):
+    EXCLUDE all point IDs already in:
+      - this tick's state_history.recent[]
+      - this tick's state_history.summaries[]
+      - the remindings queue from last tick
+
+  RANK by urgency:
+    urgency = similarity × curvature_magnitude × recency_boost × (1 + anchor_boost)
+
+  RETURN: top-K (K = 3-5, context-budget limited)
+```
+
+The `must_not` filter is critical — it's a Qdrant payload filter on point IDs, applied *before* vector search. The system never retrieves what it already knows. Pre-filtering is cheaper than post-filtering: every result is guaranteed novel.
+
+The exclusion set is small and bounded (~15-20 point IDs total from recent context + summaries + last tick's remindings).
+
+**The Anti-Recursion Guard (one retrieval per tick, one-tick delay):**
+
+```
+TICK CYCLE (one pass, no re-entry):
+
+1. Events arrive → compute emotional deltas → update buffers
+2. Snap fires? → STORE the arc (one write)
+3. RETRIEVE remindings (one search, filtered by current_context_ids)
+4. Put remindings in REMINDINGS QUEUE (not the current prompt)
+5. Build prompt from:
+   - current context (events this tick)
+   - state_history (pre-existing bundle from last cycle)
+   - remindings queue (from LAST tick's retrieval, not this one)
+6. Send to LLM
+7. Process response → emotional delta → buffer update
+
+NEXT TICK:
+  - Last tick's remindings are now in the prompt as state_history
+  - They join current_context_ids → EXCLUDED from next retrieval
+  - No recursion. Ever.
+```
+
+The critical constraint: **remindings enter the prompt on the NEXT tick, not the current one.** This means:
+* Retrieval can never trigger more retrieval in the same cycle
+* The one-tick delay is cognitively realistic — you notice an association, *then* process it
+* Remindings now "in memory" (in the prompt) are automatically excluded from future retrieval
+
+**Urgency ordering determines rehydration priority:**
+* High urgency = strong resonance + volatile current state + relevant recency → rehydrate first if context budget allows
+* Low urgency remindings sit in queue → promoted next tick if curvature stays high, naturally replaced if situation resolves
+* No explicit eviction: next tick's fresh retrieval replaces stale remindings
+
+**Why filter before search, not after:** Post-filtering wastes Qdrant's search budget on results you'll discard. If half the top-10 are already in context, you only get 5 useful results. Pre-filtering via `must_not` tells Qdrant: "don't even score these." Every result is novel.
+
+**Why this prevents recursion:** The tick boundary is a hard gate. Retrieval results can only influence the *next* cycle's prompt, never the current one. A memory that enters the prompt is immediately added to the exclusion set and can never be "re-remembered." The system can't chase its own tail because the output of retrieval is separated from the input of retrieval by exactly one tick.
 
 ## Multi-Axis Retrieval
 

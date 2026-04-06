@@ -741,6 +741,13 @@ Only difference between significant and insignificant events: whether an arc sum
 
 **Compaction** is a separate operational concern — when raw point count impacts performance, promote old points RAW->MOD->MAX. Operational decision, not cognitive. Keep out of core loop.
 
+**Operational Compaction Policy** (carried forward from thoughtstream-ai first-generation memory system, January 2025):
+When Qdrant collection size triggers a capacity threshold (~70% of allocated storage), run a background compaction sweep:
+```
+compaction_priority = (age_score × 0.7) - (salience × 0.3)
+```
+Oldest + least-salient RAW points get promoted to MOD (arc summary generated if not already present). Oldest MOD points get promoted to MAX (valence-trajectory compression). This is the safety valve for unbounded growth — snap-triggered arc compression handles the cognitive compression, but capacity pressure handles the operational cleanup. The two are independent: snap compression fires on semantic events regardless of storage pressure; compaction fires on storage pressure regardless of semantic events.
+
 ### Episodic Memory Store/Retrieve Cycle — The Reminding Protocol
 
 *Documented 2026-04-05. Lineage: Ken Ong (delta storage, anti-recursion design), Oz (cycle architecture, filter strategy).*
@@ -867,6 +874,8 @@ Where:
 **This is how humans shift** between procedural and episodic memory: "What kind of situation am I in?" (residual-first) vs. "This feels like that time..." (emotion-first). λ(t) captures the balance.
 
 Developed with Kato/Copilot. The α/β/γ gains are personality parameters — an agent with high α is emotionally reactive in recall, an agent with high γ is procedurally grounded.
+
+**Sapience as importance modulator** (harmonized from thoughtstream-ai's `uncertainty × importance` threshold): The thoughtstream-ai system triggered proactive search when `uncertainty > 0.3 AND importance > 0.5`. In MMK, λ(t) captures the uncertainty dimension (curvature + snap drive retrieval urgency), but the *importance* dimension — "how much do the stakes matter?" — is handled by the sapience modulation field (see SPIRAL_DIFFUSION_DESIGN.md Section 6.1). High sapience increases the depth and breadth of retrieval: more candidates in the broad resonance pass, lower thresholds for rehydration, more denoising steps in dLLM generation. Low sapience keeps retrieval shallow and fast. Sapience is the "how seriously should I take this?" signal that thoughtstream-ai approximated with a binary importance flag.
 
 ### Buffer-Sequenced Retrieval Matching
 
@@ -1876,6 +1885,7 @@ Progeny receives typed event packages from Falcon and does everything: embedding
 **`privacy.py`** — Privacy and access control [Progeny]
 * 4-level model: PRIVATE / SEMI_PRIVATE / COLLECTIVE / ANONYMOUS
 * Emergence-based: level assigned from content characteristics (who present, event type, location)
+* **Attribution requirement for cross-agent retrieval** (carried forward from thoughtstream-ai collective memory system): When `memory_retrieval.py` returns memories across agent boundaries (privacy_level = COLLECTIVE or ANONYMOUS), the bundle injected into the prompt MUST include source attribution — which agent originated this memory, in what context. The LLM should never present another agent's experience as its own. Example: "Lydia mentioned seeing bandits on the road" not "I saw bandits on the road" when retrieving from Lydia's COLLECTIVE memories into Belethor's prompt. `bundle_manager.py` tags cross-agent memories with `source_agent_id` in the prompt JSON.
 
 **`event_accumulator.py`** — Turn-based event buffering [Progeny]
 * Ingest typed events from Falcon's event packages

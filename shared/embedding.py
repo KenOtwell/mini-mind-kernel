@@ -30,12 +30,30 @@ def load_model() -> None:
 
     Called once at startup from server.py lifespan. If not called
     explicitly, the model loads lazily on first embed() call.
+
+    Caps PyTorch/numpy CPU threads to avoid spiking all cores during
+    tensor ops — be a good neighbor to Skyrim, Ollama, and STT on
+    shared hardware. Controlled via EMBED_CPU_THREADS env var.
     """
     global _model
     if _model is not None:
         return
 
+    import torch
     from sentence_transformers import SentenceTransformer
+
+    # Cap CPU parallelism before loading the model. PyTorch defaults to
+    # using all cores for intra-op parallelism, which thrashes shared
+    # resources. 2 threads is efficient for small-batch embedding.
+    cpu_threads = settings.embedding.cpu_threads
+    torch.set_num_threads(cpu_threads)
+    # Interop threads can only be set once per process — guard for
+    # test harness reloads and idempotent startup.
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass  # Already set — fine, it's a one-time config
+    logger.info("PyTorch CPU threads capped at %d", cpu_threads)
 
     model_name = settings.embedding.model_name
     device = settings.embedding.device

@@ -203,15 +203,16 @@ class TestPromptPassedToLLM:
         assert len(captured_calls) == 2
         # Collect all agents across all groups
         all_agent_ids = []
-        all_present_npcs = []
+        all_group_contexts = []
         for call in captured_calls:
             json_part = call[1]["content"].split("\n\n")[0]
             data = json.loads(json_part)
             all_agent_ids.extend(a["agent_id"] for a in data["agents"])
-            all_present_npcs.append(data.get("present_npcs", []))
+            all_group_contexts.append(data.get("group_context", {}))
         assert sorted(all_agent_ids) == ["Belethor", "Lydia"]
-        # Each group sees ALL present NPCs for cross-agent awareness
-        for present in all_present_npcs:
+        # Each group sees ALL present NPCs via shared group_context
+        for gc in all_group_contexts:
+            present = gc.get("present_npcs", [])
             assert "Lydia" in present
             assert "Belethor" in present
         # Final merged response has both

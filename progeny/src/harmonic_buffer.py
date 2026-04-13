@@ -13,10 +13,14 @@ Derived signals:
              The priority gradient — how fast is emotion changing?
   snap:      change in curvature (2nd derivative).
              Event boundary detector — marks emotional phase transitions.
-  λ(t):      cosine similarity between fast and slow traces.
-             Emotional tension indicator — when low, the agent's immediate
-             feelings diverge from their deep temperament. Tension wants
-             to resolve, and that resolution drives emergent behavior.
+  coherence: cross-buffer agreement across all 9 dimensions.
+             Per-dimension variance across fast/medium/slow, mapped to [0,1].
+             High = stable state across timescales. Low = volatile transition.
+  λ(t):      retrieval balance — emotional vs. residual search weighting.
+             σ(α·curvature + β·|snap| - γ·coherence)
+             High (~1.0) = emotion-first recall (episodes, grudges).
+             Low  (~0.0) = residual-first recall (domain knowledge, tactics).
+             Driven by volatility and event boundaries, damped by stability.
 
 Zero-init pattern: new agents start at ZERO_SEMAGRAM. The first emotional
 update IS the initial value — no separate initialization needed.
@@ -35,10 +39,20 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class HarmonicConfig:
-    """EMA decay rates for the three harmonic traces."""
+    """EMA decay rates, coherence scaling, and λ(t) retrieval balance gains."""
     alpha_fast: float = 0.7
     alpha_medium: float = 0.3
     alpha_slow: float = 0.1
+    # Cross-buffer coherence sensitivity — higher = more discriminating.
+    # Controls how quickly coherence drops as buffer traces diverge.
+    coherence_scale: float = 10.0
+    # λ(t) retrieval balance gains (per-agent personality parameters).
+    # α: curvature gain — emotional volatility pushes toward emotion-first.
+    # β: snap gain — event boundaries push toward emotion-first.
+    # γ: coherence gain — cross-buffer stability pushes toward residual-first.
+    lambda_alpha: float = 3.0
+    lambda_beta: float = 2.0
+    lambda_gamma: float = 2.0
 
 
 # Module-level default config
@@ -56,13 +70,14 @@ class EmotionalDelta:
     """Result of a harmonic buffer update — the emotional change signal.
 
     Passed to the prompt formatter so the LLM can calibrate response
-    intensity. Maps to the EmotionalState schema fields.
+    intensity, and to the retrieval pipeline for λ-weighted search.
     """
     semagram: list[float]    # Current 9d state (fast trace)
     delta: list[float]       # 9d change vector (new - previous fast)
     curvature: float         # Magnitude of delta (priority gradient)
     snap: float              # Change in curvature (event boundary)
-    lambda_t: float          # Fast-slow coherence (tension indicator)
+    coherence: float         # Cross-buffer agreement (0=volatile, 1=stable)
+    lambda_t: float          # Retrieval balance (0=residual-first, 1=emotion-first)
 
 
 @dataclass
@@ -71,12 +86,29 @@ class HarmonicBuffer:
 
     All traces are 9d numpy arrays matching EMOTIONAL_AXES order.
     Zero-init: all traces start at zero. First update sets initial values.
+
+    Per-axis EMA rates (_alpha_fast/medium/slow) are 9d vectors, initialized
+    from the scalar config defaults. Future dynamic modulators can adjust
+    individual axes to implement Aggression gain, Confidence damping, Mood
+    bias, etc. — see Living Doc §Engine Preset Values as Dynamic Modulators.
     """
     fast: np.ndarray = field(default_factory=lambda: np.zeros(EMOTIONAL_DIM, dtype=np.float32))
     medium: np.ndarray = field(default_factory=lambda: np.zeros(EMOTIONAL_DIM, dtype=np.float32))
     slow: np.ndarray = field(default_factory=lambda: np.zeros(EMOTIONAL_DIM, dtype=np.float32))
+    # Per-axis EMA rates — 9d vectors for per-axis modulation.
+    # Default: uniform rates from HarmonicConfig scalars.
+    _alpha_fast: np.ndarray = field(
+        default_factory=lambda: np.full(EMOTIONAL_DIM, _config.alpha_fast, dtype=np.float32),
+    )
+    _alpha_medium: np.ndarray = field(
+        default_factory=lambda: np.full(EMOTIONAL_DIM, _config.alpha_medium, dtype=np.float32),
+    )
+    _alpha_slow: np.ndarray = field(
+        default_factory=lambda: np.full(EMOTIONAL_DIM, _config.alpha_slow, dtype=np.float32),
+    )
     prev_curvature: float = 0.0
     _initialized: bool = False
+    _last_delta: EmotionalDelta | None = field(default=None, repr=False)
 
     def update(self, new_semagram: list[float] | np.ndarray) -> EmotionalDelta:
         """Update all three EMA traces with a new 9d semagram.
@@ -97,10 +129,11 @@ class HarmonicBuffer:
             self._initialized = True
             delta = new  # First delta is the full semagram
         else:
-            # EMA update: trace = α * new + (1 - α) * trace
-            self.fast = _config.alpha_fast * new + (1 - _config.alpha_fast) * self.fast
-            self.medium = _config.alpha_medium * new + (1 - _config.alpha_medium) * self.medium
-            self.slow = _config.alpha_slow * new + (1 - _config.alpha_slow) * self.slow
+            # Per-axis EMA: trace[d] = α[d] * new[d] + (1 - α[d]) * trace[d]
+            # Element-wise numpy multiplication handles all 9 axes at once.
+            self.fast = self._alpha_fast * new + (1 - self._alpha_fast) * self.fast
+            self.medium = self._alpha_medium * new + (1 - self._alpha_medium) * self.medium
+            self.slow = self._alpha_slow * new + (1 - self._alpha_slow) * self.slow
             delta = self.fast - prev_fast
 
         # Curvature: magnitude of the delta (how fast is emotion changing?)
@@ -110,17 +143,31 @@ class HarmonicBuffer:
         snap = curvature - self.prev_curvature
         self.prev_curvature = curvature
 
-        # λ(t): cosine similarity between fast and slow
-        # High (~1.0) = coherent, low/negative = emotional tension
-        lambda_t = _cosine_similarity(self.fast, self.slow)
+        # Cross-buffer coherence: per-dimension variance across the three
+        # timescales, mapped to [0, 1] via exponential decay.
+        # High coherence = buffers agree (stable). Low = buffers disagree (volatile).
+        coherence = _cross_buffer_coherence(
+            self.fast, self.medium, self.slow, _config.coherence_scale,
+        )
 
-        return EmotionalDelta(
+        # λ(t): retrieval balance — emotion-first vs. residual-first.
+        # Curvature and |snap| push toward emotion-first (volatile → feel-first).
+        # Coherence pushes toward residual-first (stable → think-first).
+        lambda_t = _compute_lambda(
+            curvature, snap, coherence,
+            _config.lambda_alpha, _config.lambda_beta, _config.lambda_gamma,
+        )
+
+        result = EmotionalDelta(
             semagram=self.fast.tolist(),
             delta=delta.tolist(),
             curvature=curvature,
             snap=snap,
+            coherence=coherence,
             lambda_t=lambda_t,
         )
+        self._last_delta = result
+        return result
 
     def get_semagram(self) -> list[float]:
         """Return the current emotional state (fast trace) as a list."""
@@ -164,18 +211,15 @@ class HarmonicState:
         return buf.get_semagram()
 
     def get_delta(self, agent_id: str) -> EmotionalDelta | None:
-        """Return the last EmotionalDelta for an agent, or None."""
+        """Return the last EmotionalDelta for an agent, or None.
+
+        Returns the cached result from the most recent update() call —
+        exact, not reconstructed.
+        """
         buf = self._buffers.get(agent_id)
         if buf is None or not buf._initialized:
             return None
-        # Reconstruct from current state (no new update)
-        return EmotionalDelta(
-            semagram=buf.fast.tolist(),
-            delta=(buf.fast - buf.medium).tolist(),  # Approximate: fast-medium divergence
-            curvature=buf.prev_curvature,
-            snap=0.0,  # No new snap without a fresh update
-            lambda_t=_cosine_similarity(buf.fast, buf.slow),
-        )
+        return buf._last_delta
 
     def reset(self) -> None:
         """Clear all buffers (session reset)."""
@@ -197,10 +241,48 @@ class HarmonicState:
         return self._buffers[agent_id]
 
 
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity between two vectors. Returns 0.0 for zero vectors."""
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a < 1e-10 or norm_b < 1e-10:
-        return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))
+def _cross_buffer_coherence(
+    fast: np.ndarray,
+    medium: np.ndarray,
+    slow: np.ndarray,
+    scale: float,
+) -> float:
+    """Cross-buffer coherence: agreement across the three timescales.
+
+    Computes per-dimension variance across fast/medium/slow, then maps
+    to [0, 1] via exponential decay: exp(-scale * variance).
+
+    High coherence (≈1.0) = buffers agree, agent in stable state.
+    Low coherence  (→0.0) = buffers disagree, volatile transition.
+    """
+    stacked = np.stack([fast, medium, slow])         # (3, 9)
+    per_dim_var = np.var(stacked, axis=0)             # (9,)
+    per_dim_coherence = np.exp(-scale * per_dim_var)  # (9,) in (0, 1]
+    return float(np.mean(per_dim_coherence))
+
+
+def _compute_lambda(
+    curvature: float,
+    snap: float,
+    coherence: float,
+    alpha: float,
+    beta: float,
+    gamma: float,
+) -> float:
+    """λ(t) retrieval balance: emotion-first vs. residual-first.
+
+    σ(α·curvature + β·|snap| - γ·coherence)
+
+    Curvature and |snap| push λ toward 1 (emotion-first recall).
+    Coherence pushes λ toward 0 (residual-first recall).
+    |snap| used because both arc openings and closings should
+    trigger emotional indexing.
+    """
+    arg = alpha * curvature + beta * abs(snap) - gamma * coherence
+    return _sigmoid(arg)
+
+
+def _sigmoid(x: float) -> float:
+    """Sigmoid function, clamped to avoid overflow."""
+    x_clamped = max(-10.0, min(10.0, x))
+    return float(1.0 / (1.0 + np.exp(-x_clamped)))

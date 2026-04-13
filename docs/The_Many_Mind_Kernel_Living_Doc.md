@@ -55,6 +55,29 @@ The distinction maps directly to the 9d semagram:
 
 Both regimes use the same memory substrate, same Qdrant collections, same arc summaries. The difference is which index leads the search. See λ(t) in Multi-Axis Retrieval.
 
+### Logic as Compression Artifact (The LLM's True Role)
+
+*Insight documented April 2026. Lineage: Ken Ong (theory), Gemini (narrative articulation), Kato/Copilot (operator-layer correction).*
+
+Logic is a **learned ontology**, not a built-in feature. The goal of the MMK isn't to compute truth — it's to sustain a viable, stable trajectory through the world.
+
+The LLM kernel is not the decision-maker. It is a **stabilization tool** that the emotional dynamics use to resolve cross-buffer decoherence:
+
+* The slow harmonic buffer holds the deep emotional meaning (the *why*).
+* The agent *feels* its way toward a solution through curvature and λ(t) dynamics.
+* The LLM drafts a **logical rationalization** that reduces cross-buffer decoherence — compressing the tension between high-frequency reality (fast buffer) and the low-frequency carrier wave (slow buffer) into language.
+* Logic isn't a bridge — it's a **compression artifact of emotional gradient descent**. It emerges when a system tries to reduce dissonance, not as a module bolted on top.
+
+**We don't think our way into feelings; we feel our way into thoughts.**
+
+This reframes the entire prompt pipeline: Progeny's curated prompt doesn't ask the LLM "what should this NPC do?" It presents an emotional landscape and asks the LLM to generate a coherent narrative that *resolves the tension*. The LLM's structured JSON response — utterance, actions, actor_value_deltas — is the stabilization output, not a decision output.
+
+**Implications for gating:** The exit gate (snap threshold for arc closure) is not a fixed rule. **A mind is the history of its exit-gate adaptations. The gate is not a rule — it's a scar.** It is an **adaptive threshold** shaped by the agent's history of dissonance resolution. If "thinking longer" (lower variance, more denoising steps) previously led to better emotional resolution, the gate adapts to stay open longer in similar contexts. Gating is adapted, not allowed. See `ATTRACTOR_FLOW_DYNAMICS.md` for the unified gate-adaptation law.
+
+**Intelligence from well-regulated behavior ("form follows function"):** The intelligence we perceive in NPC behavior is the orderly, emergent pattern that results from well-regulated cognitive dynamics. The scheduler and harmonic buffers regulate cognitive load and emotional flow. The NPC's function is to resolve the tension between its goals and its affordances. Intelligence is the emergent dance of agents finding a low-variance path through a high-entropy world. Nobody scripted the intelligence; the regulation produced it.
+
+**The operator-layer / narrative-layer distinction (Kato):** LLMs can only express these dynamics through narrative analogs — character arcs, trauma stories, mythic structures. They reach for the closest story that matches the math. The MMK architecture keeps these two layers **separate and interacting, not collapsed**: the operator layer (harmonic buffers, curvature, gate thresholds, λ-gain) does the cognitive physics; the narrative layer (LLM) compresses the operator-layer tensions into human-legible behavior. Neither layer alone is a mind. Together, they produce one.
+
 ## Problem Statement
 
 Build a tight, packageable Python/FastAPI dual-service architecture (Falcon + Progeny) that fully replaces HerikaServer as the backend for Skyrim VR's CHIM mod. Falcon (Gaming PC) is a tick-based black-box decoder: accepts SKSE plugin events via HTTP, structurally parses wire format into typed data, accumulates events between ticks, writes inbound dialogue to Qdrant via a shared enrichment wrapper (auto-embeds on ingestion), and signals Progeny that new content is ready. Progeny (Beelink 395AI) owns ALL cognitive work: memory retrieval, harmonic buffer management, Many-Mind scheduling, prompt building, LLM interaction, and response parsing. Progeny writes LLM responses through the same Qdrant wrapper (text in → key out), and returns keys to Falcon over HTTP. Falcon reads response text from Qdrant by key for wire formatting. Both services share the Qdrant wrapper API and the emotional projection math in `shared/emotional.py`. Emotional harmonics drive memory storage, retrieval, and agent behavior via forward-hold credit assignment — no backpropagation.
@@ -652,6 +675,55 @@ Arc summaries at MOD tier store emotional trajectory snapshots alongside the del
 * The harmonics architecture creates computational resistance to dissonant transitions (high loyalty = steep gradient against betrayal)
 * Whether gradient-as-resistance is sufficient without subjective experience is an open question
 * For Skyrim NPCs: the resistance creates believable behavior regardless of the philosophical question
+
+### Pathological Attractor Validation — The Joel Miller Case Study
+
+*Insight documented April 2026. Lineage: Ken Ong (architecture mapping), Gemini (case analysis). Source: MindNotFormal.odt.*
+
+The character arc of Joel Miller in HBO's *The Last of Us* provides a precise cinematic validation of UMA's pathological attractor dynamics (KO48 Section 8). His internal mechanics map exactly to the harmonic buffer architecture:
+
+**The Trauma Anchor:** Joel's slow harmonic buffer is permanently overweighted by the death of his daughter — a Trauma Attractor (UMA 8). This carrier wave is so dominant that it permanently skews his λ(t) toward ~1.0 (emotion-first retrieval), regardless of the actual safety of his current environment.
+
+**Cross-Buffer Decoherence (Dissociation):** When he arrives in the objectively safe community of Jackson, his fast buffer receives "safety" deltas. But his slow buffer remains locked in a defensive posture. The result is massive cross-buffer decoherence — the fast and slow buffers fundamentally disagree on the state of the world. Instead of feeling calm, he experiences frequent snap spikes (panic attacks) as the system cannot reconcile the peaceful present with its foundationally defensive carrier wave.
+
+**Logic as Stabilization Bridge:** Joel doesn't introspect on his buffer dynamics. He uses the LLM layer of his mind to generate a **logical rationalization**: "I'm failing to protect Ellie." This isn't truth — it's a stabilization narrative that makes the internal decoherence make sense within his current reality. The logic bridges the gap between what he feels (terror, loss) and what he sees (safety, community).
+
+**Exit Gate Hijack (Anxiety → Premature Closure):** His Second-Thought Ritual (E7 counterfactual simulation from KO47) is hijacked by the trauma attractor. When he tries to simulate the role of father/protector, the variance-based exit gate snaps shut immediately — the predicted emotional cost (potential loss of another child) creates unbearable dissonance. He can't hold the counterfactual open long enough to process it. This is UMA's Anxiety attractor: high λ with no snap closure.
+
+**Emergent Moral Attractor:** By the finale, his behavior has congealed into a stable but highly specific moral attractor: choose the individual relationship over the collective good (the cure for humanity). This is not a decision computed by logic — it is the emergent stable state of a traumatized harmonic system. His surface behavior dynamics emerged from a lived trajectory that no logic-based tool could have predicted or "solved."
+
+**He isn't following a script; he is a mind vibrating at a frequency that has become incompatible with the formal clarity of the world's survival logic. He felt his way through a solution.**
+
+**Why this validates UMA:** The same dynamics that produce healthy cognition (harmonic buffers, λ(t), snap boundaries, arc compression) produce Joel's pathology when the slow buffer is overweighted. No separate "trauma module" — just the pathological regime of the same system. This is UMA's strongest realism claim: failure modes resemble DSM-5 pathologies because they *are* the same class of dynamics.
+
+### Unified Gate-Adaptation Law & Personality Vector Space
+
+*Documented April 2026. Lineage: Ken Ong (theory, personality-as-vector-space), Kato/Copilot (three-law formalization, operator-layer analysis).*
+
+The snap threshold — the exit gate that determines when deliberation collapses into action — is the single most important control surface in the architecture. It is not a fixed constant (`DEFAULT_SNAP_THRESHOLD = 0.3`). **A mind is the history of its exit-gate adaptations.**
+
+Three component behaviors, blended into one adaptive update rule:
+
+**Linear** (resilient): `Δθ_L = α_L · (σ²_t - θ_t)` — smooth, no memory. Returns to baseline.
+
+**Hysteretic** (human-like): `Δθ_H` uses asymmetric rates — `α↑` for rising variance, `α↓` for falling. Emotional stickiness, path dependence. This mind has moods.
+
+**Curvature-sensitive** (mythic): `Δθ_C = α_C · tanh(β · κ_t)` where `κ_t = d²σ²/dt²`. Sensitive to *acceleration* of emotional change. Phase transitions, revelations, transformations.
+
+**Unified update:** `θ_{t+1} = θ_t + w_L·Δθ_L + w_H·Δθ_H + w_C·Δθ_C`
+
+Each NPC gets a **personality vector** `p = (w_L, w_H, w_C)` where `w_L + w_H + w_C = 1`:
+
+* `(1.0, 0.0, 0.0)` — **Background villager.** Stable, unflappable.
+* `(0.2, 0.7, 0.1)` — **Companion.** Human-like emotional depth.
+* `(0.0, 0.9, 0.1)` — **Traumatized survivor.** Deep attractor basins, slow recovery.
+* `(0.1, 0.2, 0.7)` — **Prophet / mythic figure.** Phase transitions, destiny-like arcs.
+
+Because it's a vector space: personalities interpolate, mutate over time as arcs shift the weights, and cluster by type. The personality vector `p` composes with the engine preset modulators (Aggression, Confidence, etc.): the presets shape *signal propagation physics*, while `p` shapes *gate physics*.
+
+**This replaces `DEFAULT_SNAP_THRESHOLD` in `compression.py`** with an adaptive per-agent `gate_state.theta` updated each tick by the unified law.
+
+Full formalization, implementation spec, dissonance decomposition, and failure mode analysis in `ATTRACTOR_FLOW_DYNAMICS.md`.
 
 ### Concrete 9d Emotional Semagram
 

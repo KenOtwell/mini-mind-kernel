@@ -70,12 +70,28 @@ class TestDataPayload:
         ctx = _make_context()
         roster = _make_roster(["Lydia"])
         messages = build_prompt(ctx, roster)
-        # User message contains JSON payload followed by instruction text
         json_part = messages[1]["content"].split("\n\n")[0]
         data = json.loads(json_part)
         assert "agents" in data
         assert "player_input" in data
-        assert "present_npcs" in data
+        assert "group_context" in data
+
+    def test_group_context_has_present_npcs(self):
+        ctx = _make_context(active_npc_ids=["Lydia", "Belethor"])
+        roster = _make_roster(["Lydia", "Belethor"])
+        messages = build_prompt(ctx, roster)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        assert "present_npcs" in data["group_context"]
+        assert set(data["group_context"]["present_npcs"]) == {"Lydia", "Belethor"}
+
+    def test_group_context_has_location(self):
+        ctx = _make_context()
+        roster = _make_roster(["Lydia"])
+        messages = build_prompt(ctx, roster)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        assert "location" in data["group_context"]
 
     def test_player_input_included(self):
         ctx = _make_context("Tell me about dragons")
@@ -105,8 +121,8 @@ class TestAgentBlocks:
         assert agent["agent_id"] == "Lydia"
         assert "tier" in agent
         assert "ticks_since_last_action" in agent
-        assert "base_vector" in agent
-        assert len(agent["base_vector"]) == 9
+        assert "harmonic_state" in agent
+        assert len(agent["harmonic_state"]["base_vector"]) == 9
 
     def test_agent_block_includes_dialogue_history(self):
         ctx = _make_context()
@@ -148,7 +164,8 @@ class TestAgentBlocks:
 
 
 class TestFactPoolIntegration:
-    def test_known_world_in_agent_block_when_fact_pool_provided(self):
+    def test_shared_facts_in_group_context(self):
+        """Facts known by ALL present NPCs appear in group_context."""
         from progeny.src.fact_pool import FactPool
         pool = FactPool()
         pool.add_fact("Dragon attacked", "event", 100.0, ["Player", "Lydia"])
@@ -158,10 +175,29 @@ class TestFactPoolIntegration:
         messages = build_prompt(ctx, roster, fact_pool=pool)
         json_part = messages[1]["content"].split("\n\n")[0]
         data = json.loads(json_part)
+        gc = data["group_context"]
+        assert "shared_knowledge" in gc
+        assert "Dragon attacked" in gc["shared_knowledge"]
+
+    def test_private_facts_in_agent_block(self):
+        """Facts known by one NPC but not all go to the agent's private block."""
+        from progeny.src.fact_pool import FactPool
+        pool = FactPool()
+        # Lydia knows a secret; Player doesn't
+        pool.add_fact("Overheard Thalmor plot", "event", 100.0, ["Lydia"])
+        # Both know this one (goes to shared, not private)
+        pool.add_fact("Dragon attacked", "event", 101.0, ["Player", "Lydia"])
+
+        ctx = _make_context()
+        roster = _make_roster(["Lydia"])
+        messages = build_prompt(ctx, roster, fact_pool=pool)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
         agent = data["agents"][0]
-        assert "known_world" in agent
-        assert len(agent["known_world"]) == 1
-        assert agent["known_world"][0]["content"] == "Dragon attacked"
+        assert "private_knowledge" in agent
+        assert "Overheard Thalmor plot" in agent["private_knowledge"]
+        # Dragon attacked is shared, not private
+        assert "Dragon attacked" not in agent.get("private_knowledge", [])
 
     def test_no_fact_pool_still_works(self):
         ctx = _make_context()
@@ -169,9 +205,10 @@ class TestFactPoolIntegration:
         messages = build_prompt(ctx, roster)  # no fact_pool
         json_part = messages[1]["content"].split("\n\n")[0]
         data = json.loads(json_part)
-        assert data["agents"][0]["known_world"] == []
+        # No private_knowledge key when no facts
+        assert "private_knowledge" not in data["agents"][0]
 
-    def test_lore_context_included(self):
+    def test_lore_in_group_context(self):
         from progeny.src.fact_pool import FactPool
         pool = FactPool()
         pool.bit_index.get_or_assign("Lydia")
@@ -182,5 +219,40 @@ class TestFactPoolIntegration:
         messages = build_prompt(ctx, roster, fact_pool=pool)
         json_part = messages[1]["content"].split("\n\n")[0]
         data = json.loads(json_part)
-        assert "lore_context" in data
-        assert "Skyrim" in data["lore_context"][0]
+        gc = data["group_context"]
+        assert "lore" in gc
+        assert "Skyrim" in gc["lore"][0]
+
+
+class TestGroupDisplay:
+    def test_group_display_shows_fast_buffer(self):
+        """NPCs with emotional state show their fast buffer in group display."""
+        from progeny.src.harmonic_buffer import HarmonicState
+        state = HarmonicState()
+        angry = [0.0, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3]
+        state.update("Lydia", angry)
+
+        ctx = _make_context()
+        roster = _make_roster(["Lydia"])
+        messages = build_prompt(ctx, roster, harmonic_state=state)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        gc = data["group_context"]
+        assert "group_display" in gc
+        assert len(gc["group_display"]) == 1
+        assert gc["group_display"][0]["name"] == "Lydia"
+        assert len(gc["group_display"][0]["demeanor"]) == 9
+
+    def test_zero_state_npcs_excluded_from_display(self):
+        """NPCs with no emotional state yet don't appear in group display."""
+        from progeny.src.harmonic_buffer import HarmonicState
+        state = HarmonicState()  # No updates — all zero
+
+        ctx = _make_context()
+        roster = _make_roster(["Lydia"])
+        messages = build_prompt(ctx, roster, harmonic_state=state)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        # group_display should be empty or absent
+        display = data["group_context"].get("group_display", [])
+        assert display == []

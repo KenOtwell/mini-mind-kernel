@@ -373,6 +373,99 @@ class FactPool:
 
         return results
 
+    def query_shared(
+        self,
+        present_npc_ids: list[str],
+        category: Optional[str] = None,
+        include_superseded: bool = False,
+        limit: Optional[int] = None,
+    ) -> list[Fact]:
+        """Return facts known by ALL listed NPCs (shared group knowledge).
+
+        Uses bitmask AND: only facts where every present NPC's bit is set.
+        This is the group context — what everyone in the scene knows.
+        Facts known by some but not all are private (per-agent Layer 2).
+
+        Args:
+            present_npc_ids: NPC names present in the scene.
+            category:        Filter by category, or None for all.
+            include_superseded: If False, skip superseded facts (unless
+                               some member doesn't know the replacement).
+            limit:           Max facts to return (newest first).
+        """
+        if not present_npc_ids:
+            return []
+
+        # Build combined mask — all present NPCs must know the fact
+        present_mask = self.bit_index.mask_for_all(present_npc_ids)
+
+        if category is not None:
+            fact_ids = self._by_category.get(category, [])
+        else:
+            fact_ids = list(self._facts.keys())
+
+        results: list[Fact] = []
+        for fid in fact_ids:
+            fact = self._facts[fid]
+            # ALL present NPCs must know this fact
+            if (fact.knowledge_bits & present_mask) != present_mask:
+                continue
+            if not include_superseded and fact.is_superseded:
+                replacement = self._facts.get(fact.superseded_by)
+                if replacement is not None:
+                    if (replacement.knowledge_bits & present_mask) == present_mask:
+                        continue
+            results.append(fact)
+
+        results.sort(key=lambda f: f.game_ts, reverse=True)
+        if limit is not None:
+            results = results[:limit]
+        return results
+
+    def query_private(
+        self,
+        agent_name: str,
+        present_npc_ids: list[str],
+        category: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[Fact]:
+        """Return facts this agent knows but NOT all present NPCs know.
+
+        The complement of query_shared() — private knowledge that only
+        this agent (or a subset) possesses. Layer 2 material.
+        """
+        bit = self.bit_index.get(agent_name)
+        if bit is None:
+            return []
+
+        agent_mask = 1 << bit
+        present_mask = self.bit_index.mask_for_all(present_npc_ids)
+
+        if category is not None:
+            fact_ids = self._by_category.get(category, [])
+        else:
+            fact_ids = list(self._facts.keys())
+
+        results: list[Fact] = []
+        for fid in fact_ids:
+            fact = self._facts[fid]
+            # Agent knows it
+            if not (fact.knowledge_bits & agent_mask):
+                continue
+            # But NOT everyone knows it (not shared)
+            if (fact.knowledge_bits & present_mask) == present_mask:
+                continue
+            if fact.is_superseded:
+                replacement = self._facts.get(fact.superseded_by)
+                if replacement and (replacement.knowledge_bits & agent_mask):
+                    continue
+            results.append(fact)
+
+        results.sort(key=lambda f: f.game_ts, reverse=True)
+        if limit is not None:
+            results = results[:limit]
+        return results
+
     # ------------------------------------------------------------------
     # Prompt helpers
     # ------------------------------------------------------------------

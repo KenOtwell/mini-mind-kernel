@@ -64,6 +64,15 @@ _memory_writer = MemoryWriter()
 _memory_retriever = MemoryRetriever()
 _arc_compressor = ArcCompressor(writer=_memory_writer)
 
+# Pipeline serialization lock — prevents concurrent tick tasks from racing
+# through mutable state (_accumulator, _harmonic_state, _scheduler).
+# Within a single tick, parallel dispatch groups still run concurrently
+# via asyncio.gather (they only read shared state during LLM calls).
+# Future: the pipelined context_manager/llm_executor split will allow
+# overlapping Stage A (next tick's context) with Stage B (current LLM gen)
+# while keeping state mutations serial.
+_pipeline_lock = asyncio.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Per-group pipeline: prompt → LLM → expand
@@ -146,7 +155,17 @@ async def ingest(package: TickPackage) -> TurnResponse | AckResponse:
 
     Pipeline: accumulate → detect turn → schedule → dispatch groups →
     parallel (prompt → LLM → expand) → merge → return.
+
+    Serialized via _pipeline_lock: concurrent WebSocket ticks wait rather
+    than racing through mutable harmonic/accumulator/scheduler state.
+    Parallel dispatch groups within a single tick are unaffected.
     """
+    async with _pipeline_lock:
+        return await _ingest_inner(package)
+
+
+async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
+    """Inner pipeline — runs under _pipeline_lock."""
     tick_id = package.tick_id
 
     # Step 1: Accumulate events, detect turn boundary
@@ -201,8 +220,17 @@ async def ingest(package: TickPackage) -> TurnResponse | AckResponse:
     }
 
     # Qdrant-backed memory retrieval: pull state_history per agent.
-    # Uses the player's input as the semantic query and each agent's
-    # current emotional state as the emotional query.
+    # Semantic query: player's input embedding (what was said).
+    # Emotional query: agent's current delta (shift direction) for
+    # shift-congruent retrieval — "find events whose emotional content
+    # matches the direction I'm currently moving." Falls back to
+    # absolute semagram when curvature is near zero (stable state).
+    # NOTE: The semantic axis (residual after emotional projection) is
+    # agent-agnostic — same text residual regardless of who hears it.
+    # OPEN ISSUE: subject/object perspective inversion. "I attacked you"
+    # vs "you attacked me" have similar residuals but inverted agency.
+    # The residual encodes role geometry, not perspective. Flagged for
+    # future investigation — may need a perspective-aware retrieval axis.
     memory_bundles: dict[str, MemoryBundle] = {}
     try:
         if shared_embedding.is_loaded() and shared_emotional.is_loaded():
@@ -210,9 +238,14 @@ async def ingest(package: TickPackage) -> TurnResponse | AckResponse:
             semantic_query = player_emb.tolist()
             for agent in roster:
                 agent_id = agent.agent_id
-                emo_query = _harmonic_state.get_semagram(agent_id)
                 delta = emotional_deltas.get(agent_id)
                 lambda_t = delta.lambda_t if delta else 0.5
+                # Shift-congruent: use delta when curvature is meaningful,
+                # fall back to absolute state in calm periods.
+                if delta and delta.curvature > 0.01:
+                    emo_query = delta.delta
+                else:
+                    emo_query = _harmonic_state.get_semagram(agent_id)
                 bundle = await _memory_retriever.retrieve_for_agent(
                     agent_id=agent_id,
                     semantic_query=semantic_query,

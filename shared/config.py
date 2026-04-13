@@ -75,6 +75,11 @@ class EmbeddingConfig:
     device: str = "cpu"
     semantic_dim: int = 384
     emotional_dim: int = 9
+    # CPU thread cap for PyTorch/numpy tensor ops during embedding.
+    # Prevents the embedding model from spiking all cores and competing
+    # with Skyrim (Gaming PC) or Ollama (Beelink). 2 threads is enough
+    # for small-batch embedding (1-10 texts) without starving neighbors.
+    cpu_threads: int = field(default_factory=lambda: _env_int("EMBED_CPU_THREADS", 2))
 
 
 @dataclass

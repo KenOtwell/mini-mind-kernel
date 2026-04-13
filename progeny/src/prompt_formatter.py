@@ -1,13 +1,22 @@
 """
 Prompt formatter for Progeny — The Ritual.
 
-Builds a chat-completion messages[] array per dispatch group. In parallel
-mode, each group gets its own prompt with the same shared prefix (system
-prompt + world state + who's present) for KV cache reuse, but only its
-assigned agent blocks.
+Three-layer prompt topology optimized for KV cache reuse:
 
-Message 1 (system): Static instruction block — the reality contract.
-Message 2 (user):   Data payload + instruction, rebuilt fresh every turn.
+  Layer 0 (system): Lore + rules + response format. Static across turns
+      — benefits from full KV cache reuse between turns.
+  Layer 1 (group context): Scene shared by all present NPCs. Location,
+      shared events, shared facts (ATMS: all-bits-set), and the group
+      emotional display (fast buffers of all present NPCs). Identical
+      across dispatch groups within a tick — KV cache reuse within turn.
+  Layer 2 (agent blocks): Private per-agent data. Full harmonic state,
+      private memories/history, private knowledge (ATMS: only-my-bit),
+      goals, emotional dynamics. Varies per dispatch group.
+
+The group display — each NPC's fast buffer as their observable "face" —
+gives every agent social awareness without explicit theory-of-mind.
+The fast buffer IS the non-verbal channel: who looks tense, who just
+flinched, who's calm. Medium/slow buffers stay private (internal).
 
 Zero context rot: nothing stale survives from the previous prompt.
 Continuity comes from harmonic buffers and Qdrant retrieval, not from
@@ -19,7 +28,7 @@ import json
 import logging
 from typing import Any
 
-from shared.constants import ZERO_SEMAGRAM
+from shared.constants import EMOTIONAL_AXES, ZERO_SEMAGRAM
 from progeny.src.agent_scheduler import ScheduledAgent
 from progeny.src.event_accumulator import AgentBuffer, TieredMemory, TurnContext
 from progeny.src.fact_pool import FactPool
@@ -30,6 +39,9 @@ if TYPE_CHECKING:
     from progeny.src.harmonic_buffer import EmotionalDelta, HarmonicState
 
 logger = logging.getLogger(__name__)
+
+# Compact axis labels for the group display — saves tokens vs full names
+_DEMEANOR_AXES = [a[:3].upper() for a in EMOTIONAL_AXES]  # FEA,ANG,LOV,...
 
 
 # ---------------------------------------------------------------------------
@@ -58,16 +70,24 @@ ACTIONS (for things dials can't express — use sparingly):
   Intelligence: Inspect, LookAt, InspectSurroundings, SearchMemory
   Social: Talk, SetCurrentTask, MakeFollower, EndConversation, Relax
 
+PROMPT STRUCTURE:
+  group_context: shared scene — what everyone present can see and sense.
+    group_display: each NPC's observable demeanor (their emotional "face").
+    Axes: FEA=fear ANG=anger LOV=love DIS=disgust EXC=excitement SAD=sadness \
+JOY=joy SAF=safety RES=residual. Tension = how volatile they appear.
+  agents[]: private per-agent data — their inner state, memories, goals.
+    Only YOU (as that agent's mind) see their full internal state.
+    Other agents see only the group_display surface.
+
 RESPONSE FORMAT: Return a JSON object with a "responses" array. One entry per \
-agent listed in the prompt, in the same order. Scale detail to the agent's tier:
+agent listed, in order. Scale detail to tier:
   Tier 0: utterance + actor_value_deltas + actions + updated_harmonics + new_memories
   Tier 1: utterance + actor_value_deltas + actions
   Tier 2: actor_value_deltas + brief utterance if warranted
   Tier 3: actor_value_deltas only (nudge dials, confirm or adjust)
 
 Each agent's ticks_since_last_action tells you how long since you last attended \
-them. Calibrate accordingly — recently attended agents need small adjustments; \
-long-unattended agents may need larger updates or may be fine continuing as-is.
+them. Calibrate accordingly.
 
 Be the mind. The engine is the body."""
 
@@ -131,52 +151,156 @@ def _build_data_payload(
     fact_pool: FactPool | None = None,
     memory_bundles: dict[str, MemoryBundle] | None = None,
 ) -> dict[str, Any]:
-    """Assemble the JSON data payload for message 2."""
+    """Assemble the JSON data payload for message 2.
+
+    Three-layer structure:
+      group_context (Layer 1): shared scene — location, shared events,
+          shared facts, group emotional display. Identical across dispatch
+          groups for KV cache reuse.
+      agents[] (Layer 2): private per-agent blocks — full state, private
+          memories, private knowledge, goals.
+      player_input: the current player utterance/action.
+
+    Layer 0 (lore + rules) lives in the system prompt message.
+    """
+    roster_ids = [a.agent_id for a in roster]
+    present_ids = all_active_npc_ids if all_active_npc_ids is not None else roster_ids
+
+    # --- Layer 1: Group context (shared by all present NPCs) ---
+    group_context = _build_group_context(
+        ctx, present_ids, harmonic_state, emotional_deltas, fact_pool,
+    )
+
+    # --- Layer 2: Private agent blocks ---
     agents = []
     for scheduled in roster:
         bundle = (memory_bundles or {}).get(scheduled.agent_id)
         agent_block = _build_agent_block(
-            scheduled, ctx, harmonic_state, emotional_deltas, fact_pool, bundle,
+            scheduled, ctx, present_ids, harmonic_state, emotional_deltas,
+            fact_pool, bundle,
         )
         agents.append(agent_block)
 
-    # Present NPCs — all active NPCs this turn, not just those in this group.
-    roster_ids = [a.agent_id for a in roster]
-    present_ids = all_active_npc_ids if all_active_npc_ids is not None else roster_ids
-
-    # Lore context — shared facts known by everyone (category="lore")
-    lore_context: list[str] = []
-    if fact_pool is not None:
-        lore_facts = fact_pool.query("Player", category="lore", limit=10)
-        lore_context = [f.content for f in lore_facts]
-
     payload: dict[str, Any] = {
-        "present_npcs": present_ids,
+        "group_context": group_context,
         "agents": agents,
         "player_input": {
             "type": "inputtext",
             "text": ctx.player_input,
         },
     }
-    if lore_context:
-        payload["lore_context"] = lore_context
 
     return payload
 
 
+# ---------------------------------------------------------------------------
+# Layer 1: Group context — shared scene visible to all present NPCs
+# ---------------------------------------------------------------------------
+
+def _build_group_context(
+    ctx: TurnContext,
+    present_ids: list[str],
+    harmonic_state: "HarmonicState | None" = None,
+    emotional_deltas: "dict[str, EmotionalDelta | None] | None" = None,
+    fact_pool: FactPool | None = None,
+) -> dict[str, Any]:
+    """Build the shared group context (Layer 1).
+
+    Contains everything observable by all present NPCs:
+      - Location and environment
+      - Shared facts (ATMS: known by everyone present)
+      - Shared recent events (world events this tick)
+      - Group emotional display (fast buffers — the "face" of each NPC)
+      - Lore context
+
+    This block is identical across dispatch groups within a tick,
+    enabling KV cache reuse on the shared prefix.
+    """
+    group: dict[str, Any] = {
+        "location": _get_location(ctx),
+        "present_npcs": present_ids,
+    }
+
+    # Shared recent events — what everyone in the scene witnessed
+    shared_events = [e.raw_data for e in ctx.world_events[-10:] if e.raw_data]
+    if shared_events:
+        group["shared_events"] = shared_events
+
+    # Shared facts from ATMS — facts ALL present NPCs know
+    if fact_pool is not None:
+        all_present = ["Player"] + list(present_ids)
+        shared_facts = fact_pool.query_shared(all_present, limit=15)
+        if shared_facts:
+            group["shared_knowledge"] = [f.content for f in shared_facts]
+
+        # Lore context (universal, category="lore")
+        lore_facts = fact_pool.query("Player", category="lore", limit=10)
+        if lore_facts:
+            group["lore"] = [f.content for f in lore_facts]
+
+    # Group emotional display — fast buffer of every present NPC.
+    # This is the non-verbal channel: who looks tense, calm, scared.
+    # ~30 tokens per NPC. Medium/slow buffers stay private (Layer 2).
+    group_display = _build_group_display(
+        present_ids, harmonic_state, emotional_deltas,
+    )
+    if group_display:
+        group["group_display"] = group_display
+
+    return group
+
+
+def _build_group_display(
+    present_ids: list[str],
+    harmonic_state: "HarmonicState | None" = None,
+    emotional_deltas: "dict[str, EmotionalDelta | None] | None" = None,
+) -> list[dict[str, Any]]:
+    """Build the group emotional display — each NPC's observable "face".
+
+    The fast buffer is what you'd see on someone's expression and body
+    language. Compact: name + 9d demeanor vector + tension scalar.
+    """
+    if harmonic_state is None:
+        return []
+
+    display: list[dict[str, Any]] = []
+    for npc_id in present_ids:
+        fast = harmonic_state.get_semagram(npc_id)
+        # Skip NPCs with no emotional state yet (just registered)
+        if fast == list(ZERO_SEMAGRAM):
+            continue
+        entry: dict[str, Any] = {
+            "name": npc_id,
+            "demeanor": [round(v, 3) for v in fast],
+        }
+        # Add tension (1 - coherence) if available — how volatile they appear
+        if emotional_deltas is not None:
+            delta = emotional_deltas.get(npc_id)
+            if delta is not None:
+                entry["tension"] = round(1.0 - delta.coherence, 3)
+        display.append(entry)
+
+    return display
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: Private agent blocks
+# ---------------------------------------------------------------------------
+
 def _build_agent_block(
     scheduled: ScheduledAgent,
     ctx: TurnContext,
+    present_ids: list[str],
     harmonic_state: "HarmonicState | None" = None,
     emotional_deltas: "dict[str, EmotionalDelta | None] | None" = None,
     fact_pool: FactPool | None = None,
     memory_bundle: MemoryBundle | None = None,
 ) -> dict[str, Any]:
-    """
-    Build a single agent block at tier-appropriate granularity.
+    """Build a single agent block (Layer 2) — private per-agent data.
 
-    Phase 1: all agents get full blocks (Tier 0 format).
-    Phase 2 will scale down for Tier 1-3.
+    Contains only what this agent knows privately: full harmonic state
+    (all three buffer tiers), private knowledge, personal memories,
+    goals, and emotional dynamics. Shared scene data lives in Layer 1.
     """
     agent_id = scheduled.agent_id
     buf = ctx.agent_buffers.get(agent_id)
@@ -189,18 +313,20 @@ def _build_agent_block(
     # Tiered memory (cross-turn) — verbatim, compressed, keywords
     memory = buf.memory if buf else TieredMemory()
 
-    # Live emotional state from harmonic buffers (or zero fallback)
-    semagram = (
-        harmonic_state.get_semagram(agent_id)
-        if harmonic_state is not None
-        else ZERO_SEMAGRAM
-    )
+    # Full harmonic state — all three buffer tiers (private internal state)
+    harmonic_data = _build_harmonic_data(agent_id, harmonic_state)
 
-    # Per-agent known world from fact pool (tier-scaled limits)
-    known_world: list[dict] = []
+    # Private knowledge — facts this agent knows but not everyone does.
+    # Include Player in presence check so the shared/private split matches
+    # the group context (which also includes Player).
+    private_knowledge: list[str] = []
     if fact_pool is not None:
         fact_limit = TIER_FACT_LIMITS.get(scheduled.tier, 2)
-        known_world = fact_pool.facts_for_prompt(agent_id, limit=fact_limit)
+        all_present = ["Player"] + list(present_ids)
+        private_facts = fact_pool.query_private(
+            agent_id, all_present, limit=fact_limit,
+        )
+        private_knowledge = [f.content for f in private_facts]
 
     # State history from Qdrant retrieval (RAW anchors, MOD summaries, MAX refs)
     state_history: dict[str, Any] = {}
@@ -216,13 +342,14 @@ def _build_agent_block(
         "agent_id": agent_id,
         "tier": scheduled.tier,
         "ticks_since_last_action": scheduled.ticks_since_last_action,
-        "base_vector": semagram,
-        "known_world": known_world,
+        "harmonic_state": harmonic_data,
         "recent_events": recent_events,
         "dialogue_history": memory.verbatim,
         "compressed_history": memory.compressed,
         "distant_memories": memory.keywords,
     }
+    if private_knowledge:
+        block["private_knowledge"] = private_knowledge
     if state_history:
         block["state_history"] = state_history
 
@@ -237,15 +364,45 @@ def _build_agent_block(
             block["emotional_dynamics"] = {
                 "curvature": round(delta.curvature, 4),
                 "snap": round(delta.snap, 4),
-                "tension": round(1.0 - delta.lambda_t, 4),
+                "tension": round(1.0 - delta.coherence, 4),
             }
 
     return block
 
 
+def _build_harmonic_data(
+    agent_id: str,
+    harmonic_state: "HarmonicState | None",
+) -> dict[str, Any]:
+    """Extract full harmonic buffer data for an agent's private block.
+
+    Includes all three buffer tiers (fast/medium/slow) — the agent's
+    full internal emotional state. Medium and slow are private; only
+    the fast trace is shared in the group display.
+    """
+    if harmonic_state is None:
+        return {"base_vector": list(ZERO_SEMAGRAM)}
+
+    buf = harmonic_state._buffers.get(agent_id)
+    if buf is None or not buf._initialized:
+        return {"base_vector": list(ZERO_SEMAGRAM)}
+
+    return {
+        "base_vector": [round(v, 4) for v in buf.fast.tolist()],
+        "buffers": {
+            "fast": [round(v, 4) for v in buf.fast.tolist()],
+            "medium": [round(v, 4) for v in buf.medium.tolist()],
+            "slow": [round(v, 4) for v in buf.slow.tolist()],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _get_location(ctx: TurnContext) -> str:
     """Extract current location from world events or default."""
-    # Check for location events in this turn
     for event in reversed(ctx.world_events):
         if event.event_type == "location":
             return event.raw_data

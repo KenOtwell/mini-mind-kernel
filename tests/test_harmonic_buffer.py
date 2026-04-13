@@ -109,19 +109,53 @@ class TestHarmonicBuffer:
         delta = buf.update(_calm_semagram())
         assert abs(delta.snap) > 0.01
 
-    def test_lambda_coherent_after_init(self):
-        """After first update, fast == slow, so λ should be 1.0."""
+    def test_coherence_perfect_after_init(self):
+        """After first update, all traces identical → coherence = 1.0."""
         buf = HarmonicBuffer()
         delta = buf.update(_angry_semagram())
-        assert delta.lambda_t == pytest.approx(1.0, abs=0.01)
+        assert delta.coherence == pytest.approx(1.0, abs=0.001)
 
-    def test_lambda_diverges_on_shift(self):
-        """After a big emotional shift, fast diverges from slow → λ drops."""
+    def test_coherence_drops_on_shift(self):
+        """After a big emotional shift, buffers diverge → coherence drops."""
         buf = HarmonicBuffer()
         buf.update(_angry_semagram())
         # Shift to calm — fast moves toward calm, slow stays near angry
         delta = buf.update(_calm_semagram())
-        assert delta.lambda_t < 0.99  # Some divergence
+        assert delta.coherence < 1.0  # Some divergence
+
+    def test_lambda_high_on_first_encounter(self):
+        """First update: high curvature + high snap → emotion-first retrieval.
+
+        On the very first event, the agent is reacting to something new.
+        λ should be high — "what just happened?" drives emotional recall.
+        """
+        buf = HarmonicBuffer()
+        delta = buf.update(_angry_semagram())
+        assert delta.lambda_t > 0.5  # Emotion-first on first encounter
+
+    def test_lambda_low_in_stable_state(self):
+        """After many same-input updates: low curvature, high coherence → low λ.
+
+        The agent has settled into a stable state. Retrieval should favor
+        domain/residual matching over emotional matching.
+        """
+        buf = HarmonicBuffer()
+        sem = _angry_semagram()
+        for _ in range(50):
+            delta = buf.update(sem)
+        # Curvature near zero, coherence near 1 → λ should be low
+        assert delta.lambda_t < 0.5  # Residual-first in calm state
+
+    def test_lambda_rises_on_volatile_shift(self):
+        """Sudden shift after stable period: curvature spikes → λ rises."""
+        buf = HarmonicBuffer()
+        # Build stable angry state
+        for _ in range(20):
+            buf.update(_angry_semagram())
+        stable_delta = buf.update(_angry_semagram())
+        # Sudden shift to calm
+        volatile_delta = buf.update(_calm_semagram())
+        assert volatile_delta.lambda_t > stable_delta.lambda_t
 
     def test_get_semagram(self):
         buf = HarmonicBuffer()
@@ -184,10 +218,47 @@ class TestHarmonicState:
         assert delta is not None
         assert len(delta.semagram) == EMOTIONAL_DIM
 
+    def test_get_delta_returns_exact_cached_result(self):
+        """get_delta() returns the exact EmotionalDelta from the last update."""
+        state = HarmonicState()
+        update_delta = state.update("Lydia", _angry_semagram())
+        cached_delta = state.get_delta("Lydia")
+        assert cached_delta is update_delta  # Same object, not reconstructed
+
 
 # ---------------------------------------------------------------------------
 # Emotional momentum scenario
 # ---------------------------------------------------------------------------
+
+class TestPerAxisModulation:
+    def test_default_alpha_is_uniform_9d(self):
+        """Default alpha arrays should be uniform (same value per axis)."""
+        buf = HarmonicBuffer()
+        assert buf._alpha_fast.shape == (9,)
+        assert buf._alpha_fast[0] == buf._alpha_fast[8]  # All same
+
+    def test_per_axis_alpha_produces_asymmetric_tracking(self):
+        """Different alpha per axis → some axes track faster than others.
+
+        This is the infrastructure that dynamic modulators will use:
+        Aggression gain on anger axis, Confidence damping on fear, etc.
+        """
+        buf = HarmonicBuffer()
+        # Make anger axis (dim 1) track almost instantly on fast trace
+        buf._alpha_fast[1] = 0.99
+        # Make joy axis (dim 6) barely track on fast trace
+        buf._alpha_fast[6] = 0.05
+
+        angry = _angry_semagram()  # anger=0.8, joy=0.0
+        buf.update(angry)
+        # Now shift to calm (anger=0.0, joy=0.6)
+        buf.update(_calm_semagram())
+
+        # Anger axis (high alpha) should be close to new value (calm=0.0)
+        assert buf.fast[1] < 0.15  # Tracked toward 0 quickly
+        # Joy axis (low alpha) should barely have moved toward 0.6
+        assert buf.fast[6] < 0.15  # Didn't track much from ~0.0
+
 
 class TestEmotionalMomentum:
     def test_multi_turn_convergence(self):

@@ -98,8 +98,15 @@ INSTRUCTION_PROMPT = (
 )
 
 
-# Tier-scaled fact limits for per-agent known_world
+# Tier-scaled fact limits for per-agent private knowledge
 TIER_FACT_LIMITS: dict[int, int] = {0: 20, 1: 10, 2: 5, 3: 2}
+
+# Curvature truncation thresholds — continuous gradient from calm to crisis.
+# Below LOW: full prompt (deep memory, full history, lore).
+# Above HIGH: maximum truncation (anchors only, strip history, focus tactical).
+# Between: linear interpolation.
+CURVATURE_TRUNCATION_LOW = 0.1    # Below this → full prompt
+CURVATURE_TRUNCATION_HIGH = 0.5   # Above this → maximum truncation
 
 
 def build_prompt(
@@ -142,6 +149,28 @@ def build_prompt(
     ]
 
 
+def _urgency(emotional_deltas: "dict[str, EmotionalDelta | None] | None") -> float:
+    """Compute the scene urgency from max curvature across all agents.
+
+    Returns a value in [0, 1]: 0 = calm, 1 = crisis.
+    Used by both Layer 1 and Layer 2 to scale prompt depth.
+    """
+    if not emotional_deltas:
+        return 0.0
+    max_curv = max(
+        (d.curvature for d in emotional_deltas.values() if d is not None),
+        default=0.0,
+    )
+    # Map to [0, 1] via the truncation thresholds
+    if max_curv <= CURVATURE_TRUNCATION_LOW:
+        return 0.0
+    if max_curv >= CURVATURE_TRUNCATION_HIGH:
+        return 1.0
+    return (max_curv - CURVATURE_TRUNCATION_LOW) / (
+        CURVATURE_TRUNCATION_HIGH - CURVATURE_TRUNCATION_LOW
+    )
+
+
 def _build_data_payload(
     ctx: TurnContext,
     roster: list[ScheduledAgent],
@@ -153,22 +182,26 @@ def _build_data_payload(
 ) -> dict[str, Any]:
     """Assemble the JSON data payload for message 2.
 
-    Three-layer structure:
-      group_context (Layer 1): shared scene — location, shared events,
-          shared facts, group emotional display. Identical across dispatch
-          groups for KV cache reuse.
-      agents[] (Layer 2): private per-agent blocks — full state, private
-          memories, private knowledge, goals.
+    Three-layer structure with curvature-driven truncation:
+      group_context (Layer 1): shared scene. Truncated under high urgency
+          (strip history to anchors, drop lore, keep display + events).
+      agents[] (Layer 2): private per-agent blocks. Truncated under high
+          urgency (drop deep history, keep recent events + dynamics).
       player_input: the current player utterance/action.
 
-    Layer 0 (lore + rules) lives in the system prompt message.
+    Truncation is about cognitive focus, not speed. High curvature means
+    the agent should think about the RIGHT things (tactical situation),
+    not about everything (social history, lore, old memories).
     """
     roster_ids = [a.agent_id for a in roster]
     present_ids = all_active_npc_ids if all_active_npc_ids is not None else roster_ids
 
+    # Urgency: 0.0 = calm (full prompt), 1.0 = crisis (maximum truncation)
+    urg = _urgency(emotional_deltas)
+
     # --- Layer 1: Group context (shared by all present NPCs) ---
     group_context = _build_group_context(
-        ctx, present_ids, harmonic_state, emotional_deltas, fact_pool,
+        ctx, present_ids, harmonic_state, emotional_deltas, fact_pool, urg,
     )
 
     # --- Layer 2: Private agent blocks ---
@@ -177,7 +210,7 @@ def _build_data_payload(
         bundle = (memory_bundles or {}).get(scheduled.agent_id)
         agent_block = _build_agent_block(
             scheduled, ctx, present_ids, harmonic_state, emotional_deltas,
-            fact_pool, bundle,
+            fact_pool, bundle, urg,
         )
         agents.append(agent_block)
 
@@ -203,57 +236,59 @@ def _build_group_context(
     harmonic_state: "HarmonicState | None" = None,
     emotional_deltas: "dict[str, EmotionalDelta | None] | None" = None,
     fact_pool: FactPool | None = None,
+    urgency: float = 0.0,
 ) -> dict[str, Any]:
-    """Build the shared group context (Layer 1).
+    """Build the shared group context (Layer 1) with curvature truncation.
 
-    Contains everything observable by all present NPCs:
-      - Location and environment
-      - Shared facts (ATMS: known by everyone present)
-      - Shared recent events (world events this tick)
-      - Group emotional display (fast buffers — the "face" of each NPC)
-      - Lore context
+    Urgency 0.0 (calm): full history, lore, shared knowledge, display.
+    Urgency 1.0 (crisis): anchors only + display + tick events.
+    The gradient is continuous — not a binary switch.
 
-    This block is identical across dispatch groups within a tick,
-    enabling KV cache reuse on the shared prefix.
+    Always included regardless of urgency: location, present_npcs,
+    group_display (the room's emotional state), shared_events (what
+    just happened this tick). These are the tactical essentials.
     """
     group: dict[str, Any] = {
         "location": _get_location(ctx),
         "present_npcs": present_ids,
     }
 
-    # Group timeline — the shared memory of "what happened" in this scene.
-    # Three tiers, same as personal memory:
-    #   shared_recent:  verbatim recent events (newest, full fidelity)
-    #   shared_history: compressed one-liners (middle tier)
-    #   shared_anchors: SVO keyword tags (oldest, recognition triggers)
+    # Group timeline — truncated by urgency.
+    # Calm: full depth (verbatim + compressed + anchors).
+    # Crisis: anchors only (SVO recognition triggers, minimal tokens).
     gm = ctx.group_memory
-    if gm.verbatim:
-        group["shared_recent"] = gm.verbatim[-10:]  # Cap at 10 most recent
-    if gm.compressed:
-        group["shared_history"] = gm.compressed[-10:]
+    if urgency < 0.5:
+        # Calm to moderate: include verbatim and compressed
+        if gm.verbatim:
+            group["shared_recent"] = gm.verbatim[-10:]
+        if gm.compressed:
+            group["shared_history"] = gm.compressed[-10:]
+    # Anchors always included (cheap, ~15 tokens each)
     if gm.keywords:
         group["shared_anchors"] = gm.keywords[-10:]
 
-    # Shared tick events — world events from this tick specifically
+    # Shared tick events — always included (what just happened)
     shared_events = [e.raw_data for e in ctx.world_events[-10:] if e.raw_data]
     if shared_events:
         group["shared_events"] = shared_events
 
-    # Shared facts from ATMS — facts ALL present NPCs know
-    if fact_pool is not None:
+    # Shared facts and lore — dropped under high urgency.
+    # Lore and background knowledge are irrelevant during a crisis;
+    # the agent should focus on the immediate situation.
+    if urgency < 0.7 and fact_pool is not None:
         all_present = ["Player"] + list(present_ids)
         shared_facts = fact_pool.query_shared(all_present, limit=15)
         if shared_facts:
             group["shared_knowledge"] = [f.content for f in shared_facts]
 
-        # Lore context (universal, category="lore")
-        lore_facts = fact_pool.query("Player", category="lore", limit=10)
-        if lore_facts:
-            group["lore"] = [f.content for f in lore_facts]
+        if urgency < 0.3:
+            # Only include lore when fully calm
+            lore_facts = fact_pool.query("Player", category="lore", limit=10)
+            if lore_facts:
+                group["lore"] = [f.content for f in lore_facts]
 
-    # Group emotional display — fast buffer of every present NPC.
-    # This is the non-verbal channel: who looks tense, calm, scared.
-    # ~30 tokens per NPC. Medium/slow buffers stay private (Layer 2).
+    # Group emotional display — always included. This IS the tactical
+    # information during a crisis: who looks scared, who's ready to fight.
     group_display = _build_group_display(
         present_ids, harmonic_state, emotional_deltas,
     )
@@ -308,69 +343,89 @@ def _build_agent_block(
     emotional_deltas: "dict[str, EmotionalDelta | None] | None" = None,
     fact_pool: FactPool | None = None,
     memory_bundle: MemoryBundle | None = None,
+    urgency: float = 0.0,
 ) -> dict[str, Any]:
-    """Build a single agent block (Layer 2) — private per-agent data.
+    """Build a single agent block (Layer 2) with curvature truncation.
 
-    Contains only what this agent knows privately: full harmonic state
-    (all three buffer tiers), private knowledge, personal memories,
-    goals, and emotional dynamics. Shared scene data lives in Layer 1.
+    Urgency 0.0 (calm): full depth — all memory tiers, private knowledge,
+        state history, dialogue history. Rich, reflective prompt.
+    Urgency 1.0 (crisis): stripped — recent events + harmonic state +
+        emotional dynamics only. Focused, tactical prompt.
+
+    The gradient is continuous. At medium urgency, dialogue_history is
+    trimmed and deep memories drop. Recent events and emotional dynamics
+    always survive — they're the tactical essentials.
     """
     agent_id = scheduled.agent_id
     buf = ctx.agent_buffers.get(agent_id)
 
-    # Recent events for this agent (from this turn's tick accumulation)
+    # Recent events — always included (what just happened to this agent)
     recent_events = []
     if buf:
         recent_events = [e.raw_data for e in buf.events[-10:]]
 
-    # Tiered memory (cross-turn) — verbatim, compressed, keywords
+    # Tiered memory (cross-turn)
     memory = buf.memory if buf else TieredMemory()
 
-    # Full harmonic state — all three buffer tiers (private internal state)
+    # Harmonic state — always included (the agent's internal state)
     harmonic_data = _build_harmonic_data(agent_id, harmonic_state)
 
-    # Private knowledge — facts this agent knows but not everyone does.
-    # Include Player in presence check so the shared/private split matches
-    # the group context (which also includes Player).
-    private_knowledge: list[str] = []
-    if fact_pool is not None:
-        fact_limit = TIER_FACT_LIMITS.get(scheduled.tier, 2)
-        all_present = ["Player"] + list(present_ids)
-        private_facts = fact_pool.query_private(
-            agent_id, all_present, limit=fact_limit,
-        )
-        private_knowledge = [f.content for f in private_facts]
-
-    # State history from Qdrant retrieval (RAW anchors, MOD summaries, MAX refs)
-    state_history: dict[str, Any] = {}
-    if memory_bundle is not None:
-        if memory_bundle.recent:
-            state_history["recent"] = memory_bundle.recent
-        if memory_bundle.summaries:
-            state_history["summaries"] = memory_bundle.summaries
-        if memory_bundle.expandable_refs:
-            state_history["expandable_refs"] = memory_bundle.expandable_refs
-
+    # Start with essentials that survive any urgency level
     block: dict[str, Any] = {
         "agent_id": agent_id,
         "tier": scheduled.tier,
         "ticks_since_last_action": scheduled.ticks_since_last_action,
         "harmonic_state": harmonic_data,
         "recent_events": recent_events,
-        "dialogue_history": memory.verbatim,
-        "compressed_history": memory.compressed,
-        "distant_memories": memory.keywords,
     }
-    if private_knowledge:
-        block["private_knowledge"] = private_knowledge
-    if state_history:
-        block["state_history"] = state_history
 
-    # Active task — persistent goal the agent is working toward
+    # --- Curvature-driven truncation gradient ---
+    # Calm (urgency < 0.3): full depth
+    # Moderate (0.3-0.7): trim deep history, keep recent
+    # Crisis (urgency > 0.7): strip to essentials
+
+    if urgency < 0.7:
+        # Dialogue history — trimmed under moderate urgency
+        history_depth = max(1, int(len(memory.verbatim) * (1.0 - urgency)))
+        if memory.verbatim:
+            block["dialogue_history"] = memory.verbatim[-history_depth:]
+
+    if urgency < 0.5:
+        # Compressed history and distant memories — dropped under pressure
+        if memory.compressed:
+            block["compressed_history"] = memory.compressed
+        if memory.keywords:
+            block["distant_memories"] = memory.keywords
+
+    if urgency < 0.7:
+        # Private knowledge — dropped under crisis
+        if fact_pool is not None:
+            fact_limit = TIER_FACT_LIMITS.get(scheduled.tier, 2)
+            all_present = ["Player"] + list(present_ids)
+            private_facts = fact_pool.query_private(
+                agent_id, all_present, limit=fact_limit,
+            )
+            if private_facts:
+                block["private_knowledge"] = [f.content for f in private_facts]
+
+    # State history from Qdrant — always included if available
+    # (remindings are already curated by the retrieval pipeline)
+    if memory_bundle is not None:
+        state_history: dict[str, Any] = {}
+        if memory_bundle.recent:
+            state_history["recent"] = memory_bundle.recent
+        if memory_bundle.summaries:
+            state_history["summaries"] = memory_bundle.summaries
+        if memory_bundle.expandable_refs:
+            state_history["expandable_refs"] = memory_bundle.expandable_refs
+        if state_history:
+            block["state_history"] = state_history
+
+    # Active task — always included (the agent needs to know its goal)
     if buf and buf.active_task:
         block["active_task"] = buf.active_task
 
-    # Emotional dynamics — curvature/snap/tension for LLM calibration
+    # Emotional dynamics — always included (curvature/snap/tension)
     if emotional_deltas is not None:
         delta = emotional_deltas.get(agent_id)
         if delta is not None:

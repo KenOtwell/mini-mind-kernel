@@ -283,6 +283,118 @@ class TestGroupTimeline:
         assert "shared_anchors" not in gc
 
 
+class TestCurvatureTruncation:
+    """Verify curvature-driven prompt truncation — cognitive focus under pressure."""
+
+    def test_calm_includes_full_group_history(self):
+        """Low urgency: full shared_recent, shared_history, lore."""
+        from progeny.src.event_accumulator import TieredMemory
+        from progeny.src.fact_pool import FactPool
+
+        ctx = _make_context()
+        ctx.group_memory = TieredMemory(
+            verbatim=[{"role": "Player", "content": "Tell me a story."}],
+            compressed=["Player: discussed lore"],
+            keywords=["lore | history"],
+        )
+        pool = FactPool()
+        pool.bit_index.get_or_assign("Lydia")
+        pool.add_lore("Skyrim is the homeland of the Nords")
+
+        roster = _make_roster(["Lydia"])
+        # No emotional deltas → urgency = 0.0
+        messages = build_prompt(ctx, roster, fact_pool=pool)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        gc = data["group_context"]
+
+        assert "shared_recent" in gc
+        assert "shared_history" in gc
+        assert "shared_anchors" in gc
+        assert "lore" in gc
+
+    def test_crisis_strips_to_anchors_only(self):
+        """High urgency: only anchors + display + events survive."""
+        from progeny.src.event_accumulator import TieredMemory
+        from progeny.src.harmonic_buffer import EmotionalDelta
+
+        ctx = _make_context()
+        ctx.group_memory = TieredMemory(
+            verbatim=[{"role": "Player", "content": "Run!"}],
+            compressed=["Player: ran from dragon"],
+            keywords=["dragon | flee | danger"],
+        )
+        roster = _make_roster(["Lydia"])
+        # High curvature → urgency = 1.0
+        high_curv_delta = EmotionalDelta(
+            semagram=[0.0]*9, delta=[0.0]*9,
+            curvature=0.8, snap=0.5, coherence=0.3, lambda_t=0.9,
+        )
+        deltas = {"Lydia": high_curv_delta}
+        messages = build_prompt(ctx, roster, emotional_deltas=deltas)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        gc = data["group_context"]
+
+        # Anchors survive
+        assert "shared_anchors" in gc
+        # Full history stripped
+        assert "shared_recent" not in gc
+        assert "shared_history" not in gc
+        assert "lore" not in gc
+
+    def test_crisis_strips_agent_deep_memory(self):
+        """High urgency: agent block drops dialogue_history and compressed."""
+        from progeny.src.harmonic_buffer import EmotionalDelta
+
+        ctx = _make_context()
+        ctx.agent_buffers["Lydia"].memory.verbatim = [
+            {"role": "user", "content": "old conversation"},
+        ]
+        ctx.agent_buffers["Lydia"].memory.compressed = ["old summary"]
+        ctx.agent_buffers["Lydia"].memory.keywords = ["old | tags"]
+
+        roster = _make_roster(["Lydia"])
+        high_curv_delta = EmotionalDelta(
+            semagram=[0.0]*9, delta=[0.0]*9,
+            curvature=0.8, snap=0.5, coherence=0.3, lambda_t=0.9,
+        )
+        deltas = {"Lydia": high_curv_delta}
+        messages = build_prompt(ctx, roster, emotional_deltas=deltas)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        agent = data["agents"][0]
+
+        # Deep memory stripped under crisis
+        assert "dialogue_history" not in agent
+        assert "compressed_history" not in agent
+        assert "distant_memories" not in agent
+        # Essentials survive
+        assert "harmonic_state" in agent
+        assert "recent_events" in agent
+        assert "emotional_dynamics" in agent
+
+    def test_calm_agent_has_full_depth(self):
+        """Low urgency: agent block has all memory tiers."""
+        ctx = _make_context()
+        ctx.agent_buffers["Lydia"].memory.verbatim = [
+            {"role": "user", "content": "conversation"},
+        ]
+        ctx.agent_buffers["Lydia"].memory.compressed = ["summary"]
+        ctx.agent_buffers["Lydia"].memory.keywords = ["tags"]
+
+        roster = _make_roster(["Lydia"])
+        # No deltas → urgency = 0.0
+        messages = build_prompt(ctx, roster)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        agent = data["agents"][0]
+
+        assert "dialogue_history" in agent
+        assert "compressed_history" in agent
+        assert "distant_memories" in agent
+
+
 class TestGroupDisplay:
     def test_group_display_shows_fast_buffer(self):
         """NPCs with emotional state show their fast buffer in group display."""

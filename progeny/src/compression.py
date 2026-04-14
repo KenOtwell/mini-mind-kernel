@@ -1,22 +1,22 @@
 """
-Compression — RAW → MOD → MAX tier promotion.
+Compression — RAW → MOD → MAX tier promotion + scene-level compression.
 
-Arc summaries (MOD) are generated when snap exceeds threshold — an event
-boundary has been detected, meaning the emotional trajectory changed.
-The summary condenses the span from arc-start to arc-end into a search aid.
+Three compressors:
+  ArcCompressor     — per-agent. Triggers on snap threshold (emotional
+                      phase transition). Generates MOD-tier arc summaries.
+  SceneCompressor   — group-level. Triggers on significant presence changes
+                      (NPCs entering/exiting the scene). Generates compact
+                      SVO scene-break markers in the group memory timeline.
+  EssenceDistiller  — operational. Compacts old MOD → MAX when point count
+                      impacts performance.
 
-Essence distillation (MAX) is operational compaction when point count
-impacts performance. Not part of the core cognitive loop.
-
-LLM is used for summarization — the same Ollama instance used for NPC
-dialogue. Compression prompts are short and simple.
-
-See living doc §Memory Architecture and §Storage Trigger.
+See living doc §Memory Architecture, §Storage Trigger, and Phase 2 plan.
 """
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+import re
+from typing import Any, Optional, TYPE_CHECKING
 
 from qdrant_client.models import FieldCondition, Filter, MatchValue, Range
 
@@ -25,7 +25,13 @@ from shared.constants import COLLECTION_NPC_MEMORIES
 from .memory_writer import MemoryWriter
 from .qdrant_client import get_points_by_ids, scroll_filtered
 
+if TYPE_CHECKING:
+    from .event_accumulator import PresenceChanges, TieredMemory
+
 logger = logging.getLogger(__name__)
+
+# Matches capitalized multi-char words (names, places)
+_ENTITY_RE = re.compile(r"\b[A-Z][a-zA-Z]{2,}\b")
 
 # Snap threshold for arc boundary detection.
 # Tunable per-agent via harmonic_buffer personality parameters.
@@ -162,6 +168,136 @@ class ArcCompressor:
         # First line + "..." + last two lines
         summary = f"{lines[0]} [...] {lines[-2]} {lines[-1]}"
         return summary[:max_chars]
+
+
+class SceneCompressor:
+    """Generates scene-break markers when the group composition changes.
+
+    Triggered by significant presence changes (2+ NPCs entering/exiting).
+    Produces compact SVO-form summaries of the preceding scene and inserts
+    them into the group memory's compressed tier.
+
+    Scene markers serve as retrieval anchors: compact enough for the
+    keywords tier (~15 tokens), rich enough to trigger recognition
+    when a similar scene recurs.
+
+    Not per-agent — this compresses the shared group timeline.
+    """
+
+    # Minimum total enter+exit count to consider a scene boundary.
+    # 1 NPC arriving is routine; 2+ is a meaningful composition shift.
+    MIN_CHANGES: int = 2
+
+    def should_compress(
+        self,
+        presence_changes: "PresenceChanges",
+    ) -> bool:
+        """Check if presence changes warrant a scene-break marker."""
+        total = len(presence_changes.entered) + len(presence_changes.exited)
+        return total >= self.MIN_CHANGES
+
+    def compress_scene(
+        self,
+        group_memory: "TieredMemory",
+        location: str,
+        presence_changes: "PresenceChanges",
+    ) -> str:
+        """Generate a scene-break marker and insert into group memory.
+
+        Extracts participants and key actions from recent verbatim entries,
+        combines with location and presence delta into an SVO-form marker:
+          [Scene: Whiterun] Lydia, Player | discussed dragons | Belethor exited
+
+        The marker goes into group_memory.compressed (MOD tier equivalent
+        for the group timeline). The slide_window pipeline will eventually
+        distill it further into keywords.
+
+        Returns the marker text.
+        """
+        # Extract participants from recent verbatim (who spoke)
+        speakers = _extract_speakers(group_memory.verbatim[-10:])
+
+        # Extract key entities/actions from recent content
+        action_summary = _extract_action_summary(group_memory.verbatim[-10:])
+
+        # Build the marker
+        parts = [f"[Scene: {location}]"]
+
+        if speakers:
+            parts.append(", ".join(speakers))
+
+        if action_summary:
+            parts.append(action_summary)
+
+        if presence_changes.entered:
+            parts.append(f"+{','.join(presence_changes.entered)}")
+        if presence_changes.exited:
+            parts.append(f"-{','.join(presence_changes.exited)}")
+
+        marker = " | ".join(parts)
+
+        # Insert into the compressed tier of group memory
+        group_memory.compressed.append(marker)
+
+        logger.info(
+            "Scene break: %s (%d entered, %d exited)",
+            marker[:80],
+            len(presence_changes.entered),
+            len(presence_changes.exited),
+        )
+        return marker
+
+
+def _extract_speakers(verbatim: list[dict]) -> list[str]:
+    """Extract unique speaker names from verbatim entries, preserving order."""
+    seen: set[str] = set()
+    speakers: list[str] = []
+    for entry in verbatim:
+        role = entry.get("role", "")
+        if role and role not in seen:
+            seen.add(role)
+            speakers.append(role)
+    return speakers
+
+
+def _extract_action_summary(verbatim: list[dict], max_chars: int = 60) -> str:
+    """Extract a compact action summary from recent verbatim entries.
+
+    Heuristic SVO extraction: finds named entities and action-like verbs
+    from the content of recent entries. Produces a brief phrase.
+    """
+    if not verbatim:
+        return ""
+
+    # Collect all content text
+    all_text = " ".join(entry.get("content", "") for entry in verbatim)
+    if not all_text.strip():
+        return ""
+
+    # Extract named entities (capitalized words)
+    entities = list(dict.fromkeys(_ENTITY_RE.findall(all_text)))  # unique, ordered
+
+    # Take the first sentence of the most recent entry as the action core
+    last_content = verbatim[-1].get("content", "")
+    # First clause: up to first punctuation or 60 chars
+    clause_match = re.match(r"^(.+?)[.!?,;]", last_content)
+    if clause_match:
+        action_core = clause_match.group(1).strip()
+    else:
+        action_core = last_content[:max_chars].strip()
+
+    # Combine: entities mentioned + action core, capped
+    entity_str = ",".join(entities[:3])  # Top 3 entities
+    if entity_str and action_core:
+        result = f"{action_core} re:{entity_str}"
+    elif action_core:
+        result = action_core
+    elif entity_str:
+        result = f"re:{entity_str}"
+    else:
+        result = ""
+
+    return result[:max_chars]
 
 
 class EssenceDistiller:

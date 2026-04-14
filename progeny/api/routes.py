@@ -43,7 +43,7 @@ from progeny.src import emotional_delta
 from progeny.src.harmonic_buffer import HarmonicState
 from progeny.src.memory_writer import MemoryWriter
 from progeny.src.memory_retrieval import MemoryRetriever, MemoryBundle
-from progeny.src.compression import ArcCompressor, DEFAULT_SNAP_THRESHOLD
+from progeny.src.compression import ArcCompressor, SceneCompressor, DEFAULT_SNAP_THRESHOLD
 from progeny.src import qdrant_client as progeny_qdrant
 from shared import embedding as shared_embedding
 from shared import emotional as shared_emotional
@@ -63,8 +63,9 @@ _harmonic_state = HarmonicState()
 _memory_writer = MemoryWriter()
 _memory_retriever = MemoryRetriever()
 _arc_compressor = ArcCompressor(writer=_memory_writer)
+_scene_compressor = SceneCompressor()
 
-# Reminding queue — one-tick-delayed retrieval results.
+# Reminding queue
 # Retrieval from tick N enters the prompt on tick N+1 (not N).
 # This is the anti-recursion guard from the Living Doc: a memory that
 # enters the prompt is immediately in the current context and excluded
@@ -281,6 +282,17 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
 
     # Emotional pipeline: inbound text → 9d projection → update harmonic buffers
     emotional_delta.process_inbound(turn_context, _harmonic_state)
+
+    # Scene-level compression — when group composition changes significantly,
+    # generate an SVO scene-break marker in the group timeline. This captures
+    # "what happened here" before the scene shifts. Triggers before recognition
+    # retrieval so the marker is available for the next tick's prompt.
+    if _scene_compressor.should_compress(turn_context.presence_changes):
+        _scene_compressor.compress_scene(
+            _accumulator._group_memory,
+            _accumulator.current_location,
+            turn_context.presence_changes,
+        )
 
     # Recognition bootstrap — presence-change retrieval trigger.
     # When an NPC enters the scene, existing agents fire referent-filtered

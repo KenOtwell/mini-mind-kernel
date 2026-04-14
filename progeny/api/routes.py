@@ -32,7 +32,7 @@ from shared.schemas import (
 from shared.constants import COLLECTION_NPC_MEMORIES
 from shared import qdrant_wrapper
 from progeny.src.event_accumulator import EventAccumulator, TurnContext
-from progeny.src.agent_scheduler import AgentScheduler, DispatchGroup
+from progeny.src.agent_scheduler import AgentScheduler, DispatchGroup, NpcScheduleInfo
 from progeny.src.fact_pool import FactPool
 from progeny.src import prompt_formatter
 from progeny.src import llm_client
@@ -82,6 +82,36 @@ _reminding_queue: dict[str, MemoryBundle] = {}
 # overlapping Stage A (next tick's context) with Stage B (current LLM gen)
 # while keeping state mutations serial.
 _pipeline_lock = asyncio.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Scheduler helpers
+# ---------------------------------------------------------------------------
+
+def _build_schedule_info(turn_context: TurnContext) -> list[NpcScheduleInfo]:
+    """Build NpcScheduleInfo list from current pipeline state.
+
+    Extracts curvature from harmonic buffers and collaboration status
+    from agent buffers. Position data from util_location_npc events
+    will be added when NPC position tracking is wired in.
+    """
+    info_list = []
+    for agent_id in turn_context.active_npc_ids:
+        # Curvature from harmonic state
+        delta = _harmonic_state.get_delta(agent_id)
+        curvature = delta.curvature if delta else 0.0
+
+        # Collaboration: has an active task or is a known collaborator
+        buf = _accumulator._agent_buffers.get(agent_id)
+        is_collaborating = bool(buf and buf.active_task)
+
+        info_list.append(NpcScheduleInfo(
+            agent_id=agent_id,
+            position=None,  # TODO: wire from util_location_npc parsed data
+            is_collaborating=is_collaborating,
+            curvature=curvature,
+        ))
+    return info_list
 
 
 # ---------------------------------------------------------------------------
@@ -379,8 +409,15 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
     except Exception as exc:
         logger.warning("RAW write pass failed (non-fatal): %s", exc)
 
-    # Step 2: Schedule agents
-    roster = _scheduler.schedule(turn_context.active_npc_ids)
+    # Step 2: Schedule agents — build NpcScheduleInfo with curvature data.
+    # Position data comes from util_location_npc events (when available).
+    # Collaboration status comes from agent buffers (active_task, follower).
+    npc_info = _build_schedule_info(turn_context)
+    roster = _scheduler.schedule(
+        turn_context.active_npc_ids,
+        npc_info=npc_info,
+        player_position=None,  # TODO: extract from util_location_npc events
+    )
     if not roster:
         logger.warning("Tick %s: no agents to schedule", tick_id)
         return TurnResponse(tick_id=tick_id, processing_time_ms=0, model_used="none")

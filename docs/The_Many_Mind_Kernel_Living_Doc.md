@@ -278,33 +278,47 @@ When NPCs are in scripted quest sequences, the Creation Engine's quest AI owns t
 
 ## Current State
 
-**GitHub**: https://github.com/KenOtwell/many-mind-kernel (public, MIT). Falcon + Progeny code, shared schemas, **400 tests passing**. Both Falcon (StealthVI) and Progeny (Beelink) pull from this repo.
+**GitHub**: https://github.com/KenOtwell/many-mind-kernel (public, MIT). Falcon + Progeny code, shared schemas, **466 tests passing**. Both Falcon (StealthVI) and Progeny (Beelink) pull from this repo.
 
 **Qdrant Instance**: Native Windows binary, ports 6333 (REST) / 6334 (gRPC), bound to `0.0.0.0` (LAN-accessible). Progeny connects over LAN.
 
 **Shared Enrichment Layer** (committed, in `shared/`):
 * `emotional.py` — 384d → 9d semagram projection. Basis loading, single/batch projection, residual computation. Used by both Falcon and Progeny.
-* `embedding.py` — all-MiniLM-L6-v2 sentence embeddings on CPU. Singleton model loading, batch/single embed. Used by both Falcon and Progeny.
+* `embedding.py` — all-MiniLM-L6-v2 sentence embeddings on CPU. Singleton model loading, batch/single embed. CPU thread cap (`EMBED_CPU_THREADS=2`) prevents spiking all cores alongside Skyrim/Ollama/STT.
 * `qdrant_wrapper.py` — **The enrichment gate.** `ingest()`: text in → embed (384d) → project (9d) → store dual-vector point → return key. `read_text()`: key-based point lookup. Both services call the same API.
 * `schemas.py` — `AgentResponse.utterance_key`: Progeny can return a Qdrant key instead of inline text. Falcon resolves via `read_text()`. Falls back to inline `utterance` (backward compat).
+* `config.py` — `HarmonicConfig` extended with coherence_scale, λ(t) gains (α/β/γ), and LLM harmonics blend weight.
 
 **Falcon Wiring** (committed):
 * `server.py` — Startup loads embedding model + emotional bases + initializes AsyncQdrantClient (localhost) + connects WebSocket to Progeny.
-* `progeny_protocol.py` — Persistent WebSocket client (`ws://progeny:port/ws`). `send_tick()` is fire-and-forget. Background receive loop handles `turn_response` frames asynchronously. Auto-reconnect with exponential backoff (1s→30s). Replaces the previous blocking HTTP `send_package()` pattern.
+* `progeny_protocol.py` — Persistent WebSocket client (`ws://progeny:port/ws`). `send_tick()` is fire-and-forget. Background receive loop handles `turn_response` frames asynchronously. Auto-reconnect with exponential backoff (1s→30s).
 * `routes.py` — `_process_tick()` sends tick via WebSocket (non-blocking). `_handle_turn_response()` callback resolves `utterance_key` from Qdrant, formats to wire, enqueues for SKSE. Session events forwarded to tick accumulator for Progeny visibility.
 * Response queue bounded at `maxlen=64`.
 
-**Progeny Qdrant Modules** (committed, in `progeny/src/`):
-* `qdrant_client.py` — Async module-level API: `init()`, `get_client()`, `ensure_collections()`, `write_memory()`, `write_agent_state()`, `read_agent_state()`, `search_memories()` (RRF fusion), plus generic helpers. NOTE: `write_memory()` currently takes pre-computed vectors; RAW writes will flow through the shared wrapper once Progeny's response pipeline is updated.
-* `memory_writer.py` — MemoryWriter: async RAW/MOD/MAX tier writes, world events, agent state snapshots, session stash, lore.
-* `memory_retrieval.py` — MemoryRetriever: async λ(t)-weighted dual-vector search, recency decay, referent boosting, arc expansion.
-* `compression.py` — ArcCompressor (snap-threshold → MOD) + EssenceDistiller (MOD groups → MAX).
-* `rehydration.py` — Rehydrator: async MAX→MOD→RAW expansion chain, post-interruption stash recovery.
-* `embedding.py`, `emotional_projection.py` — Re-export shims pointing to `shared/embedding.py` and `shared/emotional.py`.
+**Progeny Cognitive Pipeline** (committed, in `progeny/`):
+* `harmonic_buffer.py` — Per-agent 3-tier EMA with per-axis 9d alpha arrays. Cross-buffer coherence. λ(t) retrieval balance via σ(α·curvature + β·|snap| - γ·coherence). Cached EmotionalDelta per agent.
+* `emotional_delta.py` — Bidirectional pipeline: inbound events AND outbound LLM utterances shift agent state through the same path.
+* `agent_scheduler.py` — **Phase 2 complete**: distance-based tiering (T0≤5m, T1≤20m, T2≤50m, T3+), collaboration floor, curvature-driven promotion, harmonic cadence filtering. `NpcScheduleInfo` clean interface.
+* `event_accumulator.py` — Per-agent buffers + group-level `TieredMemory` (shared timeline). `PresenceChanges` (entered/exited NPCs) computed per tick. Session reset clears all state.
+* `prompt_formatter.py` — **Three-layer prompt topology**: Layer 0 (system/lore, cached), Layer 1 (group context: location, shared timeline, shared knowledge via ATMS, group emotional display — fast buffers as observable “faces”), Layer 2 (private agent blocks: full harmonic state, private knowledge, personal memories). **Curvature-driven truncation**: continuous gradient from calm (full depth) to crisis (anchors + display only).
+* `fact_pool.py` — ATMS bitvector knowledge tagging. `query_shared()` (all-bits-AND) and `query_private()` (complement) partition facts into Layer 1 vs Layer 2.
+* `compression.py` — ArcCompressor (snap-threshold → MOD) + **SceneCompressor** (presence-change → SVO markers in group timeline) + EssenceDistiller (MOD groups → MAX).
+* `memory_retrieval.py` — MemoryRetriever: λ(t)-weighted dual-vector search with **shift-congruent emotional query** (agent delta, not absolute state). Recency decay, referent boosting, arc expansion.
+* `memory_writer.py` — MemoryWriter: async RAW/MOD/MAX tier writes.
+* `rehydration.py` — Rehydrator: async MAX→MOD→RAW expansion chain.
+* `response_expander.py` — LLM JSON extraction with repair pass. Parses `updated_harmonics` for two-pass emotional evaluation.
+* `llm_client.py` — Async httpx client targeting Ollama/llama.cpp OpenAI-compatible API.
+* `memory_compressor.py` — Extractive tiered compression: verbatim → compressed → keywords → evict. Runs on both per-agent and group timelines.
 
-**Remaining Progeny work to close the keys-over-wire loop:**
-* `response_expander.py` — Write LLM utterances via `shared.qdrant_wrapper.ingest()` instead of inline.
-* Set `AgentResponse.utterance_key` instead of `AgentResponse.utterance` when returning to Falcon.
+**Pipeline Features** (committed, in `progeny/api/routes.py`):
+* `_pipeline_lock` — asyncio.Lock serializes tick processing; parallel dispatch groups within a tick unaffected.
+* **Reminding queue** — one-tick-delayed retrieval results. Anti-recursion guard: retrieval from tick N enters prompt on tick N+1.
+* **Recognition bootstrap** — presence-change triggers referent-filtered retrieval. Walk into a room, see an old friend, memories surface one tick later.
+* **Scene compression** — SceneCompressor fires on significant presence changes, inserts SVO markers into group timeline.
+* **Two-pass emotional evaluation** — Pass 1 (mechanical: text → embed → 9d → EMA) captures speaker intent. Pass 2 (LLM `updated_harmonics` blended at configurable weight) captures listener’s contextual reaction. Closes the prisoner/guard gap.
+* **NpcScheduleInfo** builder — extracts curvature and collaboration status from pipeline state for the scheduler.
+
+**Keys-over-wire loop**: Progeny writes LLM utterances to Qdrant via enrichment wrapper, sets `utterance_key` on responses. Falcon resolves key to text for wire formatting.
 
 **MMK Qdrant Collections** (5 new, 17 total):
 * `skyrim_npc_memories` — dual named vectors (semantic:384d + emotional:9d), indexes: agent_id, tier, game_ts, privacy_level

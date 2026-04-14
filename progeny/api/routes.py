@@ -85,6 +85,61 @@ _pipeline_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
+# Two-pass emotional evaluation — LLM harmonics application
+# ---------------------------------------------------------------------------
+
+def _apply_llm_harmonics(responses: list[AgentResponse]) -> None:
+    """Apply LLM-proposed updated_harmonics as Pass 2 emotional correction.
+
+    Pass 1 (mechanical): text → embed → 9d projection → EMA update.
+        Captures the content's emotional signature (speaker intent).
+    Pass 2 (this): LLM evaluates the agent's contextual reaction.
+        The proposed base_vector is blended into the harmonic buffer,
+        weighted by llm_harmonics_blend. This corrects for context the
+        mechanical pipeline can't see (identity, history, stakes).
+
+    The blend ensures the mechanical pipeline provides the baseline
+    (honest but dumb) and the LLM provides the contextual correction
+    (smart but potentially confabulated). Neither alone is sufficient.
+    """
+    from progeny.src.harmonic_buffer import _config as hb_config
+
+    blend = hb_config.llm_harmonics_blend
+    if blend <= 0.0:
+        return  # LLM harmonics disabled
+
+    applied = 0
+    for resp in responses:
+        if resp.updated_harmonics is None:
+            continue
+
+        proposed = resp.updated_harmonics.base_vector
+        if len(proposed) != 9:
+            continue
+
+        # Blend: weighted average of current state and LLM proposal.
+        # new = (1 - blend) * current + blend * proposed
+        # Then update the buffer with this blended target.
+        current = _harmonic_state.get_semagram(resp.agent_id)
+        blended = [
+            (1.0 - blend) * c + blend * p
+            for c, p in zip(current, proposed)
+        ]
+
+        # Apply as a regular buffer update — the EMA smoothing provides
+        # additional damping, so a single LLM proposal can't jerk the
+        # buffer violently even at blend=1.0.
+        _harmonic_state.update(resp.agent_id, blended)
+        applied += 1
+
+    if applied:
+        logger.info(
+            "Pass 2 emotional correction: %d agents updated via LLM harmonics (blend=%.2f)",
+            applied, blend,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Recognition bootstrap — presence-change retrieval
 # ---------------------------------------------------------------------------
 
@@ -457,6 +512,14 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
 
     # Emotional adoption: agent's own words shift its state (bidirectional pipeline)
     outbound_deltas = emotional_delta.process_outbound(all_responses, _harmonic_state)
+
+    # Two-pass emotional evaluation — Pass 2: LLM contextual correction.
+    # The mechanical pipeline (Pass 1) captured the text projection — how
+    # the words sounded. The LLM's updated_harmonics captures the agent's
+    # contextual reaction — how those words FELT given identity, history,
+    # and current state. This closes the prisoner/guard gap.
+    # The LLM-evaluated vector is blended into the buffer (not replacing it).
+    _apply_llm_harmonics(all_responses)
 
     # Arc compression: check snap threshold for each agent after emotional adoption.
     # If snap exceeds threshold, generate a MOD-tier arc summary from recent RAW points.

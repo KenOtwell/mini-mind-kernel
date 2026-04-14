@@ -53,6 +53,12 @@ class HarmonicConfig:
     lambda_alpha: float = 3.0
     lambda_beta: float = 2.0
     lambda_gamma: float = 2.0
+    # LLM harmonics blend weight — controls how much the LLM's proposed
+    # emotional evaluation influences the buffer vs the mechanical pipeline.
+    # Pass 1 (mechanical): text → embed → 9d → EMA (fast, context-blind).
+    # Pass 2 (LLM): contextual evaluation → blended into buffer.
+    # 0.0 = ignore LLM proposals. 1.0 = fully trust LLM. 0.3 = 30% LLM.
+    llm_harmonics_blend: float = 0.3
 
 
 # Module-level default config

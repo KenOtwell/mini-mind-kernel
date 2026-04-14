@@ -223,6 +223,109 @@ class TestPromptPassedToLLM:
         assert "Belethor" in resp_ids
 
 
+class TestLLMHarmonics:
+    """Verify two-pass emotional evaluation via updated_harmonics.
+
+    Pass 1 (mechanical): text embedding → 9d projection → EMA update.
+    Pass 2 (LLM): updated_harmonics.base_vector blended into buffer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_updated_harmonics_shifts_agent_state(self):
+        """LLM-proposed harmonics should shift the agent's emotional state."""
+        from progeny.src.harmonic_buffer import HarmonicState, configure, HarmonicConfig
+
+        # Use a fresh harmonic state for this test
+        routes._harmonic_state = HarmonicState()
+        # Set blend to 1.0 for clear signal
+        configure(HarmonicConfig(llm_harmonics_blend=1.0))
+
+        # LLM proposes high fear for Lydia
+        fear_vector = [0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
+        mock_response = json.dumps({"responses": [{
+            "agent_id": "Lydia",
+            "utterance": "I sense danger.",
+            "updated_harmonics": {"base_vector": fear_vector},
+        }]})
+
+        pkg = make_turn_package("What's wrong?", active_npc_ids=["Lydia"])
+        with patch("progeny.src.llm_client.generate", new_callable=AsyncMock) as mock_gen:
+            mock_gen.return_value = GenerateResult(content=mock_response)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await client.post(
+                    "/ingest",
+                    content=pkg.model_dump_json(),
+                    headers={"Content-Type": "application/json"},
+                )
+
+        # After Pass 2, Lydia's state should have moved toward fear
+        sem = routes._harmonic_state.get_semagram("Lydia")
+        assert sem[0] > 0.1  # Fear axis (dim 0) should be elevated
+
+        # Reset config
+        configure(HarmonicConfig())
+
+    @pytest.mark.asyncio
+    async def test_no_harmonics_no_pass2(self):
+        """Agent without updated_harmonics gets only mechanical pass."""
+        from progeny.src.harmonic_buffer import HarmonicState
+        routes._harmonic_state = HarmonicState()
+
+        mock_response = json.dumps({"responses": [{
+            "agent_id": "Lydia",
+            "utterance": "All is well.",
+            # No updated_harmonics field
+        }]})
+
+        pkg = make_turn_package("How are you?", active_npc_ids=["Lydia"])
+        with patch("progeny.src.llm_client.generate", new_callable=AsyncMock) as mock_gen:
+            mock_gen.return_value = GenerateResult(content=mock_response)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await client.post(
+                    "/ingest",
+                    content=pkg.model_dump_json(),
+                    headers={"Content-Type": "application/json"},
+                )
+
+        # State should exist (from mechanical pass) but fear shouldn't be spiked
+        sem = routes._harmonic_state.get_semagram("Lydia")
+        assert sem[0] < 0.3  # No fear injection from LLM
+
+    @pytest.mark.asyncio
+    async def test_blend_zero_disables_pass2(self):
+        """blend=0.0 should completely ignore LLM harmonics."""
+        from progeny.src.harmonic_buffer import HarmonicState, configure, HarmonicConfig
+
+        routes._harmonic_state = HarmonicState()
+        configure(HarmonicConfig(llm_harmonics_blend=0.0))
+
+        fear_vector = [0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
+        mock_response = json.dumps({"responses": [{
+            "agent_id": "Lydia",
+            "utterance": "Fine.",
+            "updated_harmonics": {"base_vector": fear_vector},
+        }]})
+
+        pkg = make_turn_package("Status?", active_npc_ids=["Lydia"])
+        with patch("progeny.src.llm_client.generate", new_callable=AsyncMock) as mock_gen:
+            mock_gen.return_value = GenerateResult(content=mock_response)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await client.post(
+                    "/ingest",
+                    content=pkg.model_dump_json(),
+                    headers={"Content-Type": "application/json"},
+                )
+
+        # Fear should NOT be elevated — blend=0.0 ignores the LLM proposal
+        sem = routes._harmonic_state.get_semagram("Lydia")
+        assert sem[0] < 0.3
+
+        configure(HarmonicConfig())
+
+
 class TestRemindingQueue:
     """Verify the one-tick-delayed reminding protocol.
 

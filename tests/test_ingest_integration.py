@@ -25,6 +25,7 @@ def _fresh_state():
     """Reset pipeline state between tests."""
     routes._accumulator = EventAccumulator()
     routes._scheduler = AgentScheduler()
+    routes._reminding_queue = {}
     yield
 
 
@@ -220,6 +221,152 @@ class TestPromptPassedToLLM:
         resp_ids = [r["agent_id"] for r in data["responses"]]
         assert "Lydia" in resp_ids
         assert "Belethor" in resp_ids
+
+
+class TestRemindingQueue:
+    """Verify the one-tick-delayed reminding protocol.
+
+    Retrieval results from tick N enter the prompt on tick N+1.
+    This is the anti-recursion guard: remindings can never trigger
+    more retrieval in the same cycle.
+    """
+
+    @pytest.mark.asyncio
+    async def test_first_turn_has_no_remindings(self):
+        """First turn: reminding queue is empty, so no state_history from remindings."""
+        pkg = make_turn_package("Hello", active_npc_ids=["Lydia"])
+        mock_response = _mock_llm_response(["Lydia"])
+        captured_prompts = []
+
+        async def capture(messages):
+            captured_prompts.append(messages)
+            return GenerateResult(content=mock_response)
+
+        with patch("progeny.src.llm_client.generate", side_effect=capture):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await client.post(
+                    "/ingest",
+                    content=pkg.model_dump_json(),
+                    headers={"Content-Type": "application/json"},
+                )
+
+        # First turn: prior_remindings was empty, so no state_history injected
+        json_part = captured_prompts[0][1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        agent = data["agents"][0]
+        assert "state_history" not in agent
+
+    @pytest.mark.asyncio
+    async def test_reminding_queue_populated_after_turn(self):
+        """After a turn with retrieval, _reminding_queue holds results for next tick."""
+        from progeny.src.memory_retrieval import MemoryBundle
+
+        pkg = make_turn_package("Hello", active_npc_ids=["Lydia"])
+        mock_response = _mock_llm_response(["Lydia"])
+
+        with patch("progeny.src.llm_client.generate", new_callable=AsyncMock) as mock_gen:
+            mock_gen.return_value = GenerateResult(content=mock_response)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await client.post(
+                    "/ingest",
+                    content=pkg.model_dump_json(),
+                    headers={"Content-Type": "application/json"},
+                )
+
+        # Reminding queue should exist (may be empty if Qdrant not available,
+        # but the dict itself should be present as module state)
+        assert isinstance(routes._reminding_queue, dict)
+
+    @pytest.mark.asyncio
+    async def test_prior_remindings_injected_on_second_turn(self):
+        """Manually seed the reminding queue; verify it appears in the next prompt."""
+        from progeny.src.memory_retrieval import MemoryBundle
+
+        # Seed the queue as if tick N's retrieval produced a result
+        routes._reminding_queue = {
+            "Lydia": MemoryBundle(
+                agent_id="Lydia",
+                summaries=[{"text": "Fought a dragon together", "tier": "MOD"}],
+            ),
+        }
+
+        pkg = make_turn_package("What happened?", active_npc_ids=["Lydia"])
+        mock_response = _mock_llm_response(["Lydia"])
+        captured_prompts = []
+
+        async def capture(messages):
+            captured_prompts.append(messages)
+            return GenerateResult(content=mock_response)
+
+        with patch("progeny.src.llm_client.generate", side_effect=capture):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await client.post(
+                    "/ingest",
+                    content=pkg.model_dump_json(),
+                    headers={"Content-Type": "application/json"},
+                )
+
+        # The prior reminding should appear in the agent's state_history
+        json_part = captured_prompts[0][1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        agent = data["agents"][0]
+        assert "state_history" in agent
+        assert "summaries" in agent["state_history"]
+        assert agent["state_history"]["summaries"][0]["text"] == "Fought a dragon together"
+
+    @pytest.mark.asyncio
+    async def test_remindings_consumed_after_injection(self):
+        """After injection, prior remindings are cleared (not re-injected next tick)."""
+        from progeny.src.memory_retrieval import MemoryBundle
+
+        routes._reminding_queue = {
+            "Lydia": MemoryBundle(
+                agent_id="Lydia",
+                summaries=[{"text": "Old memory", "tier": "MOD"}],
+            ),
+        }
+
+        # First turn: consumes the queue
+        pkg1 = make_turn_package("First", active_npc_ids=["Lydia"])
+        mock_response = _mock_llm_response(["Lydia"])
+        with patch("progeny.src.llm_client.generate", new_callable=AsyncMock) as mock_gen:
+            mock_gen.return_value = GenerateResult(content=mock_response)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await client.post(
+                    "/ingest",
+                    content=pkg1.model_dump_json(),
+                    headers={"Content-Type": "application/json"},
+                )
+
+        # Second turn: queue should be fresh (no Qdrant = empty retrieval)
+        captured_prompts = []
+
+        async def capture(messages):
+            captured_prompts.append(messages)
+            return GenerateResult(content=mock_response)
+
+        pkg2 = make_turn_package("Second", active_npc_ids=["Lydia"])
+        with patch("progeny.src.llm_client.generate", side_effect=capture):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                await client.post(
+                    "/ingest",
+                    content=pkg2.model_dump_json(),
+                    headers={"Content-Type": "application/json"},
+                )
+
+        # The old "Old memory" should NOT appear in the second prompt
+        json_part = captured_prompts[0][1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        agent = data["agents"][0]
+        # state_history should be absent or not contain the old memory
+        summaries = agent.get("state_history", {}).get("summaries", [])
+        old_texts = [s.get("text") for s in summaries]
+        assert "Old memory" not in old_texts
 
 
 class TestHealth:

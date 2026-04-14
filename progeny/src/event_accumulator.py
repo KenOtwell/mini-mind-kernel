@@ -64,6 +64,18 @@ class AgentBuffer:
 
 
 @dataclass
+class PresenceChanges:
+    """NPCs who entered or exited the scene since the last tick.
+
+    Used by the recognition bootstrap: when an NPC enters, existing
+    agents fire referent-filtered retrieval against the newcomer's ID.
+    Results queue as one-tick-delayed remindings (private, Layer 2).
+    """
+    entered: list[str] = field(default_factory=list)
+    exited: list[str] = field(default_factory=list)
+
+
+@dataclass
 class TurnContext:
     """Accumulated context for one turn, ready for prompt building."""
     player_input: str
@@ -71,6 +83,8 @@ class TurnContext:
     active_npc_ids: list[str]
     world_events: list[TypedEvent]
     session_events: list[TypedEvent]
+    group_memory: TieredMemory = field(default_factory=TieredMemory)
+    presence_changes: PresenceChanges = field(default_factory=PresenceChanges)
 
 
 class EventAccumulator:
@@ -95,16 +109,30 @@ class EventAccumulator:
         self._pending_player_input: Optional[str] = None
         # Active NPC IDs from latest tick
         self._active_npc_ids: list[str] = []
+        # Previous tick's active NPCs — for presence-change detection
+        self._prev_active_npc_ids: set[str] = set()
         # ATMS fact pool — bitvector-tagged world knowledge
         self._fact_pool = fact_pool
+        # Group-level shared timeline — the canonical record of "what happened"
+        # that all present participants share. Condenses through the same
+        # TieredMemory pipeline as personal history. Individual NPCs carry
+        # their own emotional signatures; the group memory carries the facts.
+        self._group_memory = TieredMemory()
 
     def ingest(self, package: TickPackage) -> Optional[TurnContext]:
         """
         Ingest a TickPackage from Falcon.
 
         Routes each event to the appropriate buffer based on type.
-        Returns a TurnContext if player input was detected, else None.
+        Tracks presence changes (entered/exited NPCs) for the recognition
+        bootstrap. Returns a TurnContext if player input was detected.
         """
+        # Detect presence changes before updating active IDs
+        current_set = set(package.active_npc_ids)
+        self._presence_entered = sorted(current_set - self._prev_active_npc_ids)
+        self._presence_exited = sorted(self._prev_active_npc_ids - current_set)
+        self._prev_active_npc_ids = current_set
+
         self._active_npc_ids = package.active_npc_ids
         has_player_input = False
 
@@ -162,8 +190,8 @@ class EventAccumulator:
         Flush accumulated state and return a TurnContext for prompt building.
 
         Snapshots per-agent event buffers (copies event lists) so the returned
-        TurnContext is independent of live state. Dialogue history persists
-        across turns (it's the cross-turn memory).
+        TurnContext is independent of live state. Dialogue history and group
+        memory persist across turns (they're the cross-turn timeline).
         """
         player_input = self._pending_player_input or ""
         # Snapshot: copy each buffer's events so clearing doesn't affect the context
@@ -180,6 +208,11 @@ class EventAccumulator:
             active_npc_ids=list(self._active_npc_ids),
             world_events=list(self._world_events),
             session_events=list(self._session_events),
+            group_memory=self._group_memory,  # Shared ref — persists across turns
+            presence_changes=PresenceChanges(
+                entered=self._presence_entered,
+                exited=self._presence_exited,
+            ),
         )
         # Clear tick-level buffers; agent buffers persist structure but clear events
         for buf in self._agent_buffers.values():
@@ -191,20 +224,30 @@ class EventAccumulator:
 
     def record_agent_output(self, agent_id: str, utterance: str) -> None:
         """
-        Record LLM-generated output into agent's dialogue history.
+        Record LLM-generated output into agent's dialogue history and
+        the shared group timeline.
 
         Behavior adoption: adopted as the agent's own output (role=assistant).
         On the next turn, the agent sees this as something it said.
+        Group timeline: recorded as shared event (everyone present heard it).
         """
         buf = self._get_or_create_buffer(agent_id)
         buf.dialogue_history.append({"role": "assistant", "content": utterance})
+        # Group timeline — everyone present heard this NPC speak
+        self._group_memory.verbatim.append(
+            {"role": agent_id, "content": utterance}
+        )
 
     def record_player_input(self, text: str) -> None:
-        """Record player input into dialogue history for context."""
+        """Record player input into dialogue history and group timeline."""
         # Player input goes into all active agent buffers
         for agent_id in self._active_npc_ids:
             buf = self._get_or_create_buffer(agent_id)
             buf.dialogue_history.append({"role": "user", "content": text})
+        # Group timeline — everyone present heard the player
+        self._group_memory.verbatim.append(
+            {"role": "Player", "content": text}
+        )
 
     def _extract_agent_id(self, event: TypedEvent) -> Optional[str]:
         """
@@ -277,8 +320,10 @@ class EventAccumulator:
                 self._fact_pool.propagate_earshot(fact.fact_id, companions)
 
     def _handle_reset(self) -> None:
-        """Handle init/wipe — clear all agent buffers and world state."""
-        logger.info("Session reset — clearing all agent buffers")
+        """Handle init/wipe — clear all agent buffers, world state, and group memory."""
+        logger.info("Session reset — clearing all agent buffers and group memory")
         self._agent_buffers.clear()
         self._world_events.clear()
+        self._group_memory = TieredMemory()
+        self._prev_active_npc_ids = set()
         self.current_location = "Unknown"

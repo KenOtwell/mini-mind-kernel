@@ -224,6 +224,65 @@ class TestFactPoolIntegration:
         assert "Skyrim" in gc["lore"][0]
 
 
+class TestGroupTimeline:
+    def test_shared_recent_in_group_context(self):
+        """Group memory verbatim entries appear as shared_recent."""
+        from progeny.src.event_accumulator import TieredMemory
+        ctx = _make_context()
+        ctx.group_memory = TieredMemory(
+            verbatim=[{"role": "Player", "content": "Watch out!"}],
+        )
+        roster = _make_roster(["Lydia"])
+        messages = build_prompt(ctx, roster)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        gc = data["group_context"]
+        assert "shared_recent" in gc
+        assert gc["shared_recent"][0]["content"] == "Watch out!"
+
+    def test_shared_history_in_group_context(self):
+        """Group memory compressed entries appear as shared_history."""
+        from progeny.src.event_accumulator import TieredMemory
+        ctx = _make_context()
+        ctx.group_memory = TieredMemory(
+            compressed=["Player: Watch out! [combat]"],
+        )
+        roster = _make_roster(["Lydia"])
+        messages = build_prompt(ctx, roster)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        gc = data["group_context"]
+        assert "shared_history" in gc
+        assert "Watch out" in gc["shared_history"][0]
+
+    def test_shared_anchors_in_group_context(self):
+        """Group memory keywords appear as shared_anchors."""
+        from progeny.src.event_accumulator import TieredMemory
+        ctx = _make_context()
+        ctx.group_memory = TieredMemory(
+            keywords=["Lydia:afraid | dragon | combat"],
+        )
+        roster = _make_roster(["Lydia"])
+        messages = build_prompt(ctx, roster)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        gc = data["group_context"]
+        assert "shared_anchors" in gc
+        assert "dragon" in gc["shared_anchors"][0]
+
+    def test_empty_group_memory_omitted(self):
+        """Empty group memory fields don't appear in the prompt."""
+        ctx = _make_context()  # default TieredMemory is empty
+        roster = _make_roster(["Lydia"])
+        messages = build_prompt(ctx, roster)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        gc = data["group_context"]
+        assert "shared_recent" not in gc
+        assert "shared_history" not in gc
+        assert "shared_anchors" not in gc
+
+
 class TestGroupDisplay:
     def test_group_display_shows_fast_buffer(self):
         """NPCs with emotional state show their fast buffer in group display."""

@@ -221,7 +221,20 @@ def _build_group_context(
         "present_npcs": present_ids,
     }
 
-    # Shared recent events — what everyone in the scene witnessed
+    # Group timeline — the shared memory of "what happened" in this scene.
+    # Three tiers, same as personal memory:
+    #   shared_recent:  verbatim recent events (newest, full fidelity)
+    #   shared_history: compressed one-liners (middle tier)
+    #   shared_anchors: SVO keyword tags (oldest, recognition triggers)
+    gm = ctx.group_memory
+    if gm.verbatim:
+        group["shared_recent"] = gm.verbatim[-10:]  # Cap at 10 most recent
+    if gm.compressed:
+        group["shared_history"] = gm.compressed[-10:]
+    if gm.keywords:
+        group["shared_anchors"] = gm.keywords[-10:]
+
+    # Shared tick events — world events from this tick specifically
     shared_events = [e.raw_data for e in ctx.world_events[-10:] if e.raw_data]
     if shared_events:
         group["shared_events"] = shared_events

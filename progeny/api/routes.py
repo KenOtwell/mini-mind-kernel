@@ -64,7 +64,16 @@ _memory_writer = MemoryWriter()
 _memory_retriever = MemoryRetriever()
 _arc_compressor = ArcCompressor(writer=_memory_writer)
 
-# Pipeline serialization lock — prevents concurrent tick tasks from racing
+# Reminding queue — one-tick-delayed retrieval results.
+# Retrieval from tick N enters the prompt on tick N+1 (not N).
+# This is the anti-recursion guard from the Living Doc: a memory that
+# enters the prompt is immediately in the current context and excluded
+# from future retrieval. Remindings can never trigger more retrieval
+# in the same cycle because the output of retrieval is separated from
+# the input of retrieval by exactly one tick.
+_reminding_queue: dict[str, MemoryBundle] = {}
+
+# Pipeline serialization lock
 # through mutable state (_accumulator, _harmonic_state, _scheduler).
 # Within a single tick, parallel dispatch groups still run concurrently
 # via asyncio.gather (they only read shared state during LLM calls).
@@ -72,6 +81,82 @@ _arc_compressor = ArcCompressor(writer=_memory_writer)
 # overlapping Stage A (next tick's context) with Stage B (current LLM gen)
 # while keeping state mutations serial.
 _pipeline_lock = asyncio.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Recognition bootstrap — presence-change retrieval
+# ---------------------------------------------------------------------------
+
+async def _fire_recognition_retrieval(
+    entered_npc_ids: list[str],
+    all_active_npc_ids: list[str],
+) -> None:
+    """Fire referent-filtered retrieval when NPCs enter the scene.
+
+    For each existing agent who was already present, retrieve memories
+    involving each newcomer. Results go into _reminding_queue (one-tick
+    delay) — the recognition surfaces on the next prompt, private to
+    each agent. The newcomer's face triggers the recall; the agent's
+    face may change (curvature spike) but the group context sees nothing.
+
+    Lightweight: uses only the emotional axis (the agent's current state)
+    with a referent filter. No semantic query needed — the face IS the
+    query. Retrieval limit is small (3 memories per newcomer per agent).
+    """
+    global _reminding_queue
+
+    if not shared_embedding.is_loaded() or not shared_emotional.is_loaded():
+        return
+
+    # Existing agents = everyone active EXCEPT the newcomers
+    entered_set = set(entered_npc_ids)
+    existing_agents = [npc for npc in all_active_npc_ids if npc not in entered_set]
+
+    if not existing_agents:
+        return
+
+    recognition_count = 0
+    for agent_id in existing_agents:
+        emo_query = _harmonic_state.get_semagram(agent_id)
+        # Dummy semantic query — recognition is emotion/referent driven.
+        # Use the agent's own emotional state projected to 384d as a
+        # semantic stand-in. In practice, the referent filter does the
+        # heavy lifting; the semantic axis is secondary here.
+        semantic_query = [0.0] * 384  # Neutral — referent filter dominates
+
+        for newcomer_id in entered_npc_ids:
+            try:
+                bundle = await _memory_retriever.retrieve_for_agent(
+                    agent_id=agent_id,
+                    semantic_query=semantic_query,
+                    emotional_query=emo_query,
+                    lambda_t=0.8,  # Emotion-first — "this feels like that time..."
+                    current_game_ts=time.time(),
+                    referents=[newcomer_id],
+                    broad_limit=10,
+                    final_limit=3,  # Lightweight — just top recognition hits
+                )
+                if bundle.recent or bundle.summaries:
+                    # Merge into existing reminding queue entry for this agent
+                    existing = _reminding_queue.get(agent_id)
+                    if existing is None:
+                        _reminding_queue[agent_id] = bundle
+                    else:
+                        existing.recent.extend(bundle.recent)
+                        existing.summaries.extend(bundle.summaries)
+                        existing.expandable_refs.extend(bundle.expandable_refs)
+                    recognition_count += 1
+            except Exception as exc:
+                logger.debug(
+                    "Recognition retrieval failed for %s re: %s: %s",
+                    agent_id, newcomer_id, exc,
+                )
+
+    if recognition_count:
+        logger.info(
+            "Recognition bootstrap: %d agents recalled memories of %d newcomers",
+            recognition_count, len(entered_npc_ids),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -176,14 +261,37 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
         return AckResponse(tick_id=tick_id)
 
     # --- Turn trigger detected — full pipeline ---
+    global _reminding_queue
     start_ms = time.monotonic()
     logger.info("Tick %s: turn trigger — player: %s", tick_id, turn_context.player_input[:80])
+
+    # Consume last tick's remindings — these become this tick's memory context.
+    # The one-tick delay is the anti-recursion guard: retrieval results from
+    # tick N appear in the prompt on tick N+1, never on tick N itself.
+    prior_remindings = _reminding_queue
+    _reminding_queue = {}  # Clear for this tick's fresh retrieval
+    if prior_remindings:
+        logger.info(
+            "Tick %s: injecting %d prior remindings into prompt",
+            tick_id, len(prior_remindings),
+        )
 
     # Record player input in dialogue history for all active agents
     _accumulator.record_player_input(turn_context.player_input)
 
     # Emotional pipeline: inbound text → 9d projection → update harmonic buffers
     emotional_delta.process_inbound(turn_context, _harmonic_state)
+
+    # Recognition bootstrap — presence-change retrieval trigger.
+    # When an NPC enters the scene, existing agents fire referent-filtered
+    # retrieval against the newcomer's ID. "Walk into a room, see an old
+    # friend, the last few times you were together pop into your head."
+    # Results go to _reminding_queue (one-tick delay) — private, Layer 2.
+    if turn_context.presence_changes.entered:
+        await _fire_recognition_retrieval(
+            turn_context.presence_changes.entered,
+            turn_context.active_npc_ids,
+        )
 
     # Persist inbound events to Qdrant via enrichment wrapper (RAW writes)
     # Each event text gets embedded, projected to 9d, and stored with dual vectors.
@@ -219,19 +327,20 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
         for a in roster
     }
 
-    # Qdrant-backed memory retrieval: pull state_history per agent.
+    # Qdrant-backed memory retrieval — one-tick-delayed reminding protocol.
+    #
+    # Retrieval results go into _reminding_queue for the NEXT tick's prompt,
+    # not this tick's. This tick's prompt uses prior_remindings (last tick's
+    # retrieval). The one-tick delay prevents retrieval → prompt → retrieval
+    # recursion: a memory in the prompt is in the current context and can
+    # never be "re-remembered" because retrieval output is separated from
+    # retrieval input by exactly one tick boundary.
+    #
     # Semantic query: player's input embedding (what was said).
     # Emotional query: agent's current delta (shift direction) for
     # shift-congruent retrieval — "find events whose emotional content
-    # matches the direction I'm currently moving." Falls back to
-    # absolute semagram when curvature is near zero (stable state).
-    # NOTE: The semantic axis (residual after emotional projection) is
-    # agent-agnostic — same text residual regardless of who hears it.
-    # OPEN ISSUE: subject/object perspective inversion. "I attacked you"
-    # vs "you attacked me" have similar residuals but inverted agency.
-    # The residual encodes role geometry, not perspective. Flagged for
-    # future investigation — may need a perspective-aware retrieval axis.
-    memory_bundles: dict[str, MemoryBundle] = {}
+    # matches the direction I'm currently moving."
+    # NOTE: subject/object perspective inversion is an open research issue.
     try:
         if shared_embedding.is_loaded() and shared_emotional.is_loaded():
             player_emb = shared_embedding.embed_one(turn_context.player_input)
@@ -254,13 +363,23 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
                     current_game_ts=time.time(),
                     referents=turn_context.active_npc_ids,
                 )
-                memory_bundles[agent_id] = bundle
+                # Store in reminding queue for NEXT tick (not this prompt)
+                _reminding_queue[agent_id] = bundle
             logger.info(
-                "Tick %s: retrieved memories for %d agents",
-                tick_id, len(memory_bundles),
+                "Tick %s: retrieved %d bundles → reminding queue (next tick)",
+                tick_id, len(_reminding_queue),
             )
     except Exception as exc:
         logger.warning("Memory retrieval failed (non-fatal): %s", exc)
+
+    # This tick's prompt uses PRIOR remindings (last tick's retrieval),
+    # not the fresh retrieval we just stored in _reminding_queue.
+    memory_bundles: dict[str, MemoryBundle] = prior_remindings
+
+    # Merge recognition remindings into memory_bundles if any exist.
+    # Recognition retrieval fired earlier in this tick goes into
+    # _reminding_queue. These will surface on the NEXT tick like all
+    # other remindings. No special handling needed — the queue is unified.
 
     # Step 3: Partition into dispatch groups
     groups = _scheduler.plan_dispatch(roster)
@@ -348,6 +467,8 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
         buf = _accumulator._agent_buffers.get(agent_id)
         if buf:
             slide_window(buf.memory)
+    # Slide the group timeline through the same compression pipeline
+    slide_window(_accumulator._group_memory)
 
     elapsed_ms = int((time.monotonic() - start_ms) * 1000)
     timings = _aggregate_timings(all_gen_results)

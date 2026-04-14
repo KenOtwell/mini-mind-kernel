@@ -262,3 +262,130 @@ class TestDialogueHistory:
             buf = acc._agent_buffers[agent_id]
             assert len(buf.dialogue_history) == 1
             assert buf.dialogue_history[0]["role"] == "user"
+
+
+# ---------------------------------------------------------------------------
+# Group memory timeline
+# ---------------------------------------------------------------------------
+
+class TestPresenceChanges:
+    def test_first_tick_all_entered(self):
+        """On first tick, all NPCs are newcomers (entered from empty)."""
+        acc = EventAccumulator()
+        pkg = make_turn_package("Hello", active_npc_ids=["Lydia", "Belethor"])
+        ctx = acc.ingest(pkg)
+        assert sorted(ctx.presence_changes.entered) == ["Belethor", "Lydia"]
+        assert ctx.presence_changes.exited == []
+
+    def test_stable_group_no_changes(self):
+        """Same NPCs across ticks → no presence changes."""
+        acc = EventAccumulator()
+        # First tick establishes baseline
+        acc.ingest(TickPackage(
+            events=[_speech_event("Lydia")],
+            active_npc_ids=["Lydia"],
+        ))
+        # Second tick with turn trigger — same group
+        pkg = make_turn_package("Hi", active_npc_ids=["Lydia"])
+        ctx = acc.ingest(pkg)
+        assert ctx.presence_changes.entered == []
+        assert ctx.presence_changes.exited == []
+
+    def test_newcomer_detected(self):
+        """New NPC appearing in active_npc_ids → entered."""
+        acc = EventAccumulator()
+        acc.ingest(TickPackage(
+            events=[_speech_event("Lydia")],
+            active_npc_ids=["Lydia"],
+        ))
+        pkg = make_turn_package("Hi", active_npc_ids=["Lydia", "Belethor"])
+        ctx = acc.ingest(pkg)
+        assert ctx.presence_changes.entered == ["Belethor"]
+        assert ctx.presence_changes.exited == []
+
+    def test_departure_detected(self):
+        """NPC leaving active_npc_ids → exited."""
+        acc = EventAccumulator()
+        acc.ingest(TickPackage(
+            events=[_speech_event("Lydia")],
+            active_npc_ids=["Lydia", "Belethor"],
+        ))
+        pkg = make_turn_package("Hi", active_npc_ids=["Lydia"])
+        ctx = acc.ingest(pkg)
+        assert ctx.presence_changes.entered == []
+        assert ctx.presence_changes.exited == ["Belethor"]
+
+    def test_session_reset_clears_prev(self):
+        """After session reset, all NPCs are newcomers again."""
+        acc = EventAccumulator()
+        acc.ingest(TickPackage(
+            events=[_speech_event("Lydia")],
+            active_npc_ids=["Lydia"],
+        ))
+        # Reset
+        acc.ingest(TickPackage(events=[_init_event()], active_npc_ids=[]))
+        # Next tick: Lydia is a newcomer again
+        pkg = make_turn_package("Hi", active_npc_ids=["Lydia"])
+        ctx = acc.ingest(pkg)
+        assert ctx.presence_changes.entered == ["Lydia"]
+
+
+class TestGroupMemory:
+    def test_player_input_recorded_in_group_memory(self):
+        acc = EventAccumulator()
+        acc._active_npc_ids = ["Lydia"]
+        acc.record_player_input("Watch out!")
+        assert len(acc._group_memory.verbatim) == 1
+        assert acc._group_memory.verbatim[0]["role"] == "Player"
+        assert acc._group_memory.verbatim[0]["content"] == "Watch out!"
+
+    def test_agent_output_recorded_in_group_memory(self):
+        acc = EventAccumulator()
+        acc.record_agent_output("Lydia", "I'll handle this!")
+        assert len(acc._group_memory.verbatim) == 1
+        assert acc._group_memory.verbatim[0]["role"] == "Lydia"
+        assert acc._group_memory.verbatim[0]["content"] == "I'll handle this!"
+
+    def test_group_memory_accumulates_across_turns(self):
+        """Group timeline persists across turn flushes."""
+        acc = EventAccumulator()
+        acc._active_npc_ids = ["Lydia"]
+        acc.record_player_input("Hello")
+        acc.record_agent_output("Lydia", "Greetings.")
+        # Flush a turn
+        pkg = make_turn_package("How are you?", active_npc_ids=["Lydia"])
+        ctx = acc.ingest(pkg)
+        # Group memory should have the previous entries plus the new player input
+        assert len(ctx.group_memory.verbatim) >= 2
+        roles = [e["role"] for e in ctx.group_memory.verbatim]
+        assert "Player" in roles
+        assert "Lydia" in roles
+
+    def test_group_memory_in_turn_context(self):
+        acc = EventAccumulator()
+        acc._active_npc_ids = ["Lydia"]
+        acc.record_player_input("Tell me about Whiterun")
+        pkg = make_turn_package("What's your name?", active_npc_ids=["Lydia"])
+        ctx = acc.ingest(pkg)
+        assert hasattr(ctx, "group_memory")
+        assert len(ctx.group_memory.verbatim) >= 1
+
+    def test_session_reset_clears_group_memory(self):
+        acc = EventAccumulator()
+        acc._active_npc_ids = ["Lydia"]
+        acc.record_player_input("Hello")
+        assert len(acc._group_memory.verbatim) == 1
+        # Reset
+        pkg = TickPackage(events=[_init_event()], active_npc_ids=[])
+        acc.ingest(pkg)
+        assert len(acc._group_memory.verbatim) == 0
+
+    def test_multiple_agents_all_appear_in_group_timeline(self):
+        """All speakers show up in the shared timeline."""
+        acc = EventAccumulator()
+        acc._active_npc_ids = ["Lydia", "Belethor"]
+        acc.record_player_input("Hello everyone")
+        acc.record_agent_output("Lydia", "Greetings.")
+        acc.record_agent_output("Belethor", "Do come back.")
+        roles = [e["role"] for e in acc._group_memory.verbatim]
+        assert roles == ["Player", "Lydia", "Belethor"]

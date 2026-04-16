@@ -395,6 +395,213 @@ class TestCurvatureTruncation:
         assert "distant_memories" in agent
 
 
+class TestTierScaling:
+    """Verify prompt tier-scaling — agent blocks scale with tier level.
+
+    Living Doc §Agent Priority Paging:
+      Tier 0 (Full): all fields, full buffer traces.
+      Tier 1 (Abbreviated): base_vector + curvature, trimmed events/history.
+      Tier 2 (Minimal): base_vector only, brief events.
+      Tier 3+ (Stub): base_vector only, nothing else.
+    """
+
+    def _parse_agents(self, messages):
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        return {a["agent_id"]: a for a in data["agents"]}
+
+    def test_tier0_has_full_buffers(self):
+        """Tier 0 agent gets full buffer traces (fast/medium/slow)."""
+        from progeny.src.harmonic_buffer import HarmonicState
+        state = HarmonicState()
+        state.update("Lydia", [0.0, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3])
+
+        ctx = _make_context()
+        roster = [ScheduledAgent(agent_id="Lydia", tier=0, ticks_since_last_action=0)]
+        messages = build_prompt(ctx, roster, harmonic_state=state)
+        agents = self._parse_agents(messages)
+        lydia = agents["Lydia"]
+
+        assert "buffers" in lydia["harmonic_state"]
+        assert "fast" in lydia["harmonic_state"]["buffers"]
+        assert "medium" in lydia["harmonic_state"]["buffers"]
+        assert "slow" in lydia["harmonic_state"]["buffers"]
+
+    def test_tier1_has_curvature_no_buffers(self):
+        """Tier 1 agent gets base_vector + curvature, no buffer traces."""
+        from progeny.src.harmonic_buffer import HarmonicState
+        state = HarmonicState()
+        state.update("Belethor", [0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.3, 0.0, 0.2])
+
+        ctx = _make_context(active_npc_ids=["Belethor"])
+        roster = [ScheduledAgent(agent_id="Belethor", tier=1, ticks_since_last_action=2)]
+        messages = build_prompt(ctx, roster, harmonic_state=state)
+        agents = self._parse_agents(messages)
+        belethor = agents["Belethor"]
+
+        assert len(belethor["harmonic_state"]["base_vector"]) == 9
+        assert "curvature" in belethor["harmonic_state"]
+        assert "buffers" not in belethor["harmonic_state"]
+
+    def test_tier2_has_base_vector_only(self):
+        """Tier 2 agent gets base_vector only."""
+        from progeny.src.harmonic_buffer import HarmonicState
+        state = HarmonicState()
+        state.update("Ysolda", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.1])
+
+        ctx = _make_context(active_npc_ids=["Ysolda"])
+        roster = [ScheduledAgent(agent_id="Ysolda", tier=2, ticks_since_last_action=5)]
+        messages = build_prompt(ctx, roster, harmonic_state=state)
+        agents = self._parse_agents(messages)
+        ysolda = agents["Ysolda"]
+
+        assert len(ysolda["harmonic_state"]["base_vector"]) == 9
+        assert "buffers" not in ysolda["harmonic_state"]
+        assert "curvature" not in ysolda["harmonic_state"]
+
+    def test_tier3_is_stub(self):
+        """Tier 3 agent: minimal stub — just agent_id, tier, ticks, base_vector."""
+        from progeny.src.harmonic_buffer import HarmonicState
+        state = HarmonicState()
+        state.update("Heimskr", [0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.9])
+
+        ctx = _make_context(active_npc_ids=["Heimskr"])
+        roster = [ScheduledAgent(agent_id="Heimskr", tier=3, ticks_since_last_action=47)]
+        messages = build_prompt(ctx, roster, harmonic_state=state)
+        agents = self._parse_agents(messages)
+        heimskr = agents["Heimskr"]
+
+        assert heimskr["tier"] == 3
+        assert heimskr["ticks_since_last_action"] == 47
+        assert len(heimskr["harmonic_state"]["base_vector"]) == 9
+        # Stub should NOT have these fields
+        assert "recent_events" not in heimskr
+        assert "dialogue_history" not in heimskr
+        assert "emotional_dynamics" not in heimskr
+        assert "buffers" not in heimskr["harmonic_state"]
+
+    def test_tier2_no_dialogue_history(self):
+        """Tier 2 agents don't get dialogue history."""
+        ctx = _make_context(active_npc_ids=["Ysolda"])
+        ctx.agent_buffers["Ysolda"] = AgentBuffer(agent_id="Ysolda")
+        ctx.agent_buffers["Ysolda"].dialogue_history = [
+            {"role": "user", "content": "Hello"},
+        ]
+        roster = [ScheduledAgent(agent_id="Ysolda", tier=2, ticks_since_last_action=5)]
+        messages = build_prompt(ctx, roster)
+        agents = self._parse_agents(messages)
+        assert "dialogue_history" not in agents["Ysolda"]
+
+    def test_tier1_dialogue_trimmed_to_3(self):
+        """Tier 1 agents get dialogue history capped at 3 entries."""
+        ctx = _make_context(active_npc_ids=["Belethor"])
+        ctx.agent_buffers["Belethor"] = AgentBuffer(agent_id="Belethor")
+        ctx.agent_buffers["Belethor"].dialogue_history = [
+            {"role": "user", "content": f"msg{i}"} for i in range(10)
+        ]
+        roster = [ScheduledAgent(agent_id="Belethor", tier=1, ticks_since_last_action=2)]
+        messages = build_prompt(ctx, roster)
+        agents = self._parse_agents(messages)
+        history = agents["Belethor"].get("dialogue_history", [])
+        assert len(history) <= 3
+
+    def test_tier2_events_limited_to_2(self):
+        """Tier 2 agents get at most 2 recent events."""
+        ctx = _make_context(active_npc_ids=["Ysolda"])
+        ctx.agent_buffers["Ysolda"] = AgentBuffer(agent_id="Ysolda")
+        for i in range(10):
+            ctx.agent_buffers["Ysolda"].events.append(
+                TypedEvent(event_type="info", local_ts="ts", game_ts=float(i), raw_data=f"event{i}")
+            )
+        roster = [ScheduledAgent(agent_id="Ysolda", tier=2, ticks_since_last_action=5)]
+        messages = build_prompt(ctx, roster)
+        agents = self._parse_agents(messages)
+        events = agents["Ysolda"].get("recent_events", [])
+        assert len(events) <= 2
+
+    def test_tier1_events_limited_to_5(self):
+        """Tier 1 agents get at most 5 recent events."""
+        ctx = _make_context(active_npc_ids=["Belethor"])
+        ctx.agent_buffers["Belethor"] = AgentBuffer(agent_id="Belethor")
+        for i in range(20):
+            ctx.agent_buffers["Belethor"].events.append(
+                TypedEvent(event_type="info", local_ts="ts", game_ts=float(i), raw_data=f"event{i}")
+            )
+        roster = [ScheduledAgent(agent_id="Belethor", tier=1, ticks_since_last_action=2)]
+        messages = build_prompt(ctx, roster)
+        agents = self._parse_agents(messages)
+        events = agents["Belethor"].get("recent_events", [])
+        assert len(events) <= 5
+
+    def test_mixed_tier_roster(self):
+        """Mixed roster: each agent gets tier-appropriate block granularity."""
+        from progeny.src.harmonic_buffer import HarmonicState
+        state = HarmonicState()
+        for name in ["Lydia", "Belethor", "Ysolda", "Heimskr"]:
+            state.update(name, [0.1] * 9)
+
+        ctx = _make_context(active_npc_ids=["Lydia", "Belethor", "Ysolda", "Heimskr"])
+        roster = [
+            ScheduledAgent(agent_id="Lydia", tier=0, ticks_since_last_action=0),
+            ScheduledAgent(agent_id="Belethor", tier=1, ticks_since_last_action=2),
+            ScheduledAgent(agent_id="Ysolda", tier=2, ticks_since_last_action=6),
+            ScheduledAgent(agent_id="Heimskr", tier=3, ticks_since_last_action=47),
+        ]
+        messages = build_prompt(ctx, roster, harmonic_state=state)
+        agents = self._parse_agents(messages)
+
+        # Tier 0: full buffers
+        assert "buffers" in agents["Lydia"]["harmonic_state"]
+        # Tier 1: curvature, no buffers
+        assert "curvature" in agents["Belethor"]["harmonic_state"]
+        assert "buffers" not in agents["Belethor"]["harmonic_state"]
+        # Tier 2: base_vector only
+        assert "buffers" not in agents["Ysolda"]["harmonic_state"]
+        assert "curvature" not in agents["Ysolda"]["harmonic_state"]
+        # Tier 3: stub
+        assert "recent_events" not in agents["Heimskr"]
+
+    def test_tier1_emotional_dynamics_curvature_only(self):
+        """Tier 1 gets curvature in emotional_dynamics, not snap/tension."""
+        from progeny.src.harmonic_buffer import EmotionalDelta
+        ctx = _make_context(active_npc_ids=["Belethor"])
+        roster = [ScheduledAgent(agent_id="Belethor", tier=1, ticks_since_last_action=2)]
+        delta = EmotionalDelta(
+            semagram=[0.0]*9, delta=[0.0]*9,
+            curvature=0.15, snap=0.05, coherence=0.8, lambda_t=0.4,
+        )
+        messages = build_prompt(ctx, roster, emotional_deltas={"Belethor": delta})
+        agents = self._parse_agents(messages)
+        dynamics = agents["Belethor"].get("emotional_dynamics", {})
+        assert "curvature" in dynamics
+        assert "snap" not in dynamics  # T1 doesn't get snap
+        assert "tension" not in dynamics
+
+    def test_tier0_no_private_knowledge_excluded(self):
+        """Tier 0 agent still gets private_knowledge when fact_pool provided."""
+        from progeny.src.fact_pool import FactPool
+        pool = FactPool()
+        pool.add_fact("Secret plan", "event", 100.0, ["Lydia"])
+
+        ctx = _make_context()
+        roster = [ScheduledAgent(agent_id="Lydia", tier=0, ticks_since_last_action=0)]
+        messages = build_prompt(ctx, roster, fact_pool=pool)
+        agents = self._parse_agents(messages)
+        assert "private_knowledge" in agents["Lydia"]
+
+    def test_tier1_no_private_knowledge(self):
+        """Tier 1 agents don't get private_knowledge."""
+        from progeny.src.fact_pool import FactPool
+        pool = FactPool()
+        pool.add_fact("Secret plan", "event", 100.0, ["Belethor"])
+
+        ctx = _make_context(active_npc_ids=["Belethor"])
+        roster = [ScheduledAgent(agent_id="Belethor", tier=1, ticks_since_last_action=2)]
+        messages = build_prompt(ctx, roster, fact_pool=pool)
+        agents = self._parse_agents(messages)
+        assert "private_knowledge" not in agents["Belethor"]
+
+
 class TestGroupDisplay:
     def test_group_display_shows_fast_buffer(self):
         """NPCs with emotional state show their fast buffer in group display."""

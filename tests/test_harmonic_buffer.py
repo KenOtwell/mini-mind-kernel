@@ -6,10 +6,12 @@ import pytest
 
 from shared.constants import EMOTIONAL_DIM, ZERO_SEMAGRAM
 from progeny.src.harmonic_buffer import (
+    DynamicModulators,
     EmotionalDelta,
     HarmonicBuffer,
     HarmonicConfig,
     HarmonicState,
+    build_modulators,
     configure,
 )
 
@@ -286,3 +288,221 @@ class TestEmotionalMomentum:
         # Slow should have moved very little
         drift = np.linalg.norm(slow_after - slow_before)
         assert drift < 0.15  # α=0.1 * one step
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Modulators — engine preset values as harmonic physics
+# ---------------------------------------------------------------------------
+
+class TestBuildModulators:
+    """Test the build_modulators() constructor from raw engine values."""
+
+    def test_default_values(self):
+        mods = build_modulators()
+        assert mods.aggression_gain == 0.0
+        assert mods.confidence_damp == pytest.approx(0.5)  # default confidence=2 / 4
+        assert mods.morality_threshold == 3
+        assert mods.mood_axis is None  # Neutral
+        assert mods.mood_pull == 0.0
+        assert mods.assistance_coupling == 0.0
+
+    def test_frenzied_aggression(self):
+        mods = build_modulators(aggression=3)
+        assert mods.aggression_gain == pytest.approx(1.0)
+
+    def test_foolhardy_confidence(self):
+        mods = build_modulators(confidence=4)
+        assert mods.confidence_damp == pytest.approx(1.0)
+
+    def test_cowardly_confidence(self):
+        mods = build_modulators(confidence=0)
+        assert mods.confidence_damp == 0.0
+
+    def test_happy_mood_maps_to_joy_axis(self):
+        mods = build_modulators(mood=3)
+        assert mods.mood_axis == 6  # joy axis index
+        assert mods.mood_pull > 0.0
+
+    def test_angry_mood_maps_to_anger_axis(self):
+        mods = build_modulators(mood=1)
+        assert mods.mood_axis == 1  # anger axis index
+
+    def test_neutral_mood_no_pull(self):
+        mods = build_modulators(mood=0)
+        assert mods.mood_axis is None
+        assert mods.mood_pull == 0.0
+
+    def test_full_assistance(self):
+        mods = build_modulators(assistance=2)
+        assert mods.assistance_coupling == pytest.approx(1.0)
+
+    def test_clamping_out_of_range(self):
+        """Out-of-range inputs get clamped to [0, 1]."""
+        mods = build_modulators(aggression=10, confidence=10, assistance=10)
+        assert mods.aggression_gain <= 1.0
+        assert mods.confidence_damp <= 1.0
+        assert mods.assistance_coupling <= 1.0
+
+
+class TestDynamicModulators:
+    """Test that modulators change the harmonic buffer dynamics."""
+
+    def test_aggression_increases_fast_alpha_on_anger(self):
+        """Frenzied NPC: anger axis tracks faster on fast trace."""
+        buf = HarmonicBuffer()
+        default_fast_anger = buf._alpha_fast[1]  # anger = dim 1
+        buf.apply_modulators(build_modulators(aggression=3))
+        assert buf._alpha_fast[1] > default_fast_anger
+
+    def test_aggression_decreases_slow_alpha_on_anger(self):
+        """Frenzied NPC: anger persists longer on slow trace."""
+        buf = HarmonicBuffer()
+        default_slow_anger = buf._alpha_slow[1]
+        buf.apply_modulators(build_modulators(aggression=3))
+        assert buf._alpha_slow[1] < default_slow_anger
+
+    def test_aggression_affects_excitement_axis_too(self):
+        """Aggression gain applies to both anger (1) and excitement (4)."""
+        buf = HarmonicBuffer()
+        default_fast_exc = buf._alpha_fast[4]
+        buf.apply_modulators(build_modulators(aggression=3))
+        assert buf._alpha_fast[4] > default_fast_exc
+
+    def test_aggression_leaves_fear_axis_unchanged(self):
+        """Aggression only modulates anger/excitement, not fear."""
+        buf = HarmonicBuffer()
+        default_fast_fear = buf._alpha_fast[0]
+        buf.apply_modulators(build_modulators(aggression=3))
+        assert buf._alpha_fast[0] == default_fast_fear
+
+    def test_confidence_damping_attenuates_fear_delta(self):
+        """Foolhardy NPC: fear delta is dampened in buffer update."""
+        # Two buffers: one with damping, one without
+        buf_brave = HarmonicBuffer()
+        buf_brave.apply_modulators(build_modulators(confidence=4))  # Foolhardy
+        buf_coward = HarmonicBuffer()
+        buf_coward.apply_modulators(build_modulators(confidence=0))  # Cowardly
+
+        # Initialize both with same neutral state
+        neutral = [0.0] * EMOTIONAL_DIM
+        buf_brave.update(neutral)
+        buf_coward.update(neutral)
+
+        # Hit with a fear-heavy semagram
+        fearful = [0.0] * EMOTIONAL_DIM
+        fearful[0] = 0.9  # fear axis
+        buf_brave.update(fearful)
+        buf_coward.update(fearful)
+
+        # The Foolhardy NPC's fast buffer should show less fear
+        assert buf_brave.fast[0] < buf_coward.fast[0]
+
+    def test_confidence_damping_does_not_affect_anger(self):
+        """Confidence damping only applies to fear axis, not anger."""
+        buf_brave = HarmonicBuffer()
+        buf_brave.apply_modulators(build_modulators(confidence=4))
+        buf_no_mod = HarmonicBuffer()
+
+        neutral = [0.0] * EMOTIONAL_DIM
+        buf_brave.update(neutral)
+        buf_no_mod.update(neutral)
+
+        # Hit with anger (dim 1)
+        angry = [0.0] * EMOTIONAL_DIM
+        angry[1] = 0.9
+        buf_brave.update(angry)
+        buf_no_mod.update(angry)
+
+        # Anger should be the same (confidence doesn't damp anger)
+        assert buf_brave.fast[1] == pytest.approx(buf_no_mod.fast[1], abs=1e-6)
+
+    def test_mood_pull_drifts_toward_bias(self):
+        """Happy NPC: joy axis drifts toward the mood bias over time."""
+        buf = HarmonicBuffer()
+        buf.apply_modulators(build_modulators(mood=3))  # Happy → joy axis
+
+        # Feed neutral inputs — mood pull should create drift
+        neutral = [0.0] * EMOTIONAL_DIM
+        for _ in range(100):
+            buf.update(neutral)
+
+        # Joy axis (dim 6) should have drifted positive
+        assert buf.fast[6] > 0.01
+        assert buf.slow[6] > 0.01
+
+    def test_mood_pull_does_not_affect_unbiased_axes(self):
+        """Mood pull only affects the mood axis, not others."""
+        buf = HarmonicBuffer()
+        buf.apply_modulators(build_modulators(mood=3))  # Happy → joy
+
+        neutral = [0.0] * EMOTIONAL_DIM
+        for _ in range(50):
+            buf.update(neutral)
+
+        # Fear axis (dim 0) should be essentially zero (no mood pull)
+        assert abs(buf.fast[0]) < 0.001
+
+    def test_neutral_mood_no_drift(self):
+        """Neutral mood: no pull on any axis."""
+        buf = HarmonicBuffer()
+        buf.apply_modulators(build_modulators(mood=0))  # Neutral
+
+        neutral = [0.0] * EMOTIONAL_DIM
+        for _ in range(50):
+            buf.update(neutral)
+
+        # All axes should be near zero (no pull anywhere)
+        for i in range(EMOTIONAL_DIM):
+            assert abs(buf.fast[i]) < 0.001
+
+    def test_apply_modulators_idempotent(self):
+        """Calling apply_modulators twice resets to fresh state."""
+        buf = HarmonicBuffer()
+        buf.apply_modulators(build_modulators(aggression=3))
+        fast_anger_first = buf._alpha_fast[1]
+        buf.apply_modulators(build_modulators(aggression=3))
+        assert buf._alpha_fast[1] == pytest.approx(fast_anger_first)
+
+    def test_harmonic_state_apply_modulators_forwarding(self):
+        """HarmonicState.apply_modulators() forwards to per-agent buffer."""
+        state = HarmonicState()
+        mods = build_modulators(aggression=3, mood=3)
+        state.apply_modulators("Lydia", mods)
+        buf = state._buffers["Lydia"]
+        assert buf._modulators is not None
+        assert buf._modulators.aggression_gain == pytest.approx(1.0)
+        assert buf._modulators.mood_axis == 6
+
+    def test_joker_profile_emergent_behavior(self):
+        """The Joker Example: Confidence=4, Aggression=3, Mood=Happy.
+
+        Fear signals barely register, anger/excitement amplify fast,
+        joy drifts up during calm. Threat situations convert to excitement.
+        Nobody scripted psychopath; the gain settings produced one.
+        """
+        buf = HarmonicBuffer()
+        buf.apply_modulators(build_modulators(
+            aggression=3, confidence=4, morality=0, mood=3, assistance=0,
+        ))
+
+        # Initialize with neutral
+        neutral = [0.0] * EMOTIONAL_DIM
+        buf.update(neutral)
+
+        # Ambush: fear + anger + excitement
+        ambush = [0.0] * EMOTIONAL_DIM
+        ambush[0] = 0.8   # fear
+        ambush[1] = 0.5   # anger
+        ambush[4] = 0.6   # excitement
+        buf.update(ambush)
+
+        # The Joker: fear dampened, anger/excitement amplified
+        fear_val = buf.fast[0]
+        anger_val = buf.fast[1]
+        excitement_val = buf.fast[4]
+
+        # Fear should be significantly attenuated (Foolhardy damping)
+        assert fear_val < 0.3  # raw would be ~0.56 with α=0.7
+        # Anger and excitement should be strong (aggression gain)
+        assert anger_val > 0.2
+        assert excitement_val > 0.2

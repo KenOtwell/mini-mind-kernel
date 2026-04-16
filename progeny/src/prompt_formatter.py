@@ -345,62 +345,114 @@ def _build_agent_block(
     memory_bundle: MemoryBundle | None = None,
     urgency: float = 0.0,
 ) -> dict[str, Any]:
-    """Build a single agent block (Layer 2) with curvature truncation.
+    """Build a single agent block (Layer 2) scaled by tier AND urgency.
 
-    Urgency 0.0 (calm): full depth — all memory tiers, private knowledge,
-        state history, dialogue history. Rich, reflective prompt.
-    Urgency 1.0 (crisis): stripped — recent events + harmonic state +
-        emotional dynamics only. Focused, tactical prompt.
+    Tier scaling (Living Doc §Agent Priority Paging):
+      Tier 0 (Full): all fields — identity, full buffers, full history,
+          private knowledge, emotional dynamics, state_history, task.
+      Tier 1 (Abbreviated): base_vector + curvature (no buffer traces),
+          recent events (last 5), dialogue_history (last 3), task.
+      Tier 2 (Minimal): base_vector only, recent events (last 2).
+      Tier 3+ (Stub): base_vector only. Nothing else.
 
-    The gradient is continuous. At medium urgency, dialogue_history is
-    trimmed and deep memories drop. Recent events and emotional dynamics
-    always survive — they're the tactical essentials.
+    Curvature-driven truncation (urgency gradient) applies ON TOP of tier
+    scaling for Tiers 0-1. Under crisis, even Tier 0 drops deep memory.
+    Tiers 2-3 are already sparse enough that urgency has no further effect.
     """
     agent_id = scheduled.agent_id
+    tier = scheduled.tier
     buf = ctx.agent_buffers.get(agent_id)
 
-    # Recent events — always included (what just happened to this agent)
+    # --- Tier 3+: stub block (minimal token cost) ---
+    if tier >= 3:
+        return {
+            "agent_id": agent_id,
+            "tier": tier,
+            "ticks_since_last_action": scheduled.ticks_since_last_action,
+            "harmonic_state": _build_harmonic_data(agent_id, harmonic_state, tier),
+        }
+
+    # --- Tier 2: minimal block ---
+    if tier == 2:
+        recent_events = []
+        if buf:
+            recent_events = [e.raw_data for e in buf.events[-2:]]
+        block: dict[str, Any] = {
+            "agent_id": agent_id,
+            "tier": tier,
+            "ticks_since_last_action": scheduled.ticks_since_last_action,
+            "harmonic_state": _build_harmonic_data(agent_id, harmonic_state, tier),
+        }
+        if recent_events:
+            block["recent_events"] = recent_events
+        return block
+
+    # --- Tier 1: abbreviated block ---
+    if tier == 1:
+        recent_events = []
+        if buf:
+            recent_events = [e.raw_data for e in buf.events[-5:]]
+        memory = buf.memory if buf else TieredMemory()
+
+        block = {
+            "agent_id": agent_id,
+            "tier": tier,
+            "ticks_since_last_action": scheduled.ticks_since_last_action,
+            "harmonic_state": _build_harmonic_data(agent_id, harmonic_state, tier),
+        }
+        if recent_events:
+            block["recent_events"] = recent_events
+
+        # Dialogue history — abbreviated: last 3 entries, trimmed by urgency
+        if urgency < 0.7 and memory.verbatim:
+            depth = max(1, min(3, int(len(memory.verbatim) * (1.0 - urgency))))
+            block["dialogue_history"] = memory.verbatim[-depth:]
+
+        # Active task survives at T1
+        if buf and buf.active_task:
+            block["active_task"] = buf.active_task
+
+        # Emotional dynamics at T1 (curvature is useful for LLM calibration)
+        if emotional_deltas is not None:
+            delta = emotional_deltas.get(agent_id)
+            if delta is not None:
+                block["emotional_dynamics"] = {
+                    "curvature": round(delta.curvature, 4),
+                }
+
+        return block
+
+    # --- Tier 0: full block (with curvature-driven truncation) ---
     recent_events = []
     if buf:
         recent_events = [e.raw_data for e in buf.events[-10:]]
 
-    # Tiered memory (cross-turn)
     memory = buf.memory if buf else TieredMemory()
+    harmonic_data = _build_harmonic_data(agent_id, harmonic_state, tier)
 
-    # Harmonic state — always included (the agent's internal state)
-    harmonic_data = _build_harmonic_data(agent_id, harmonic_state)
-
-    # Start with essentials that survive any urgency level
-    block: dict[str, Any] = {
+    block = {
         "agent_id": agent_id,
-        "tier": scheduled.tier,
+        "tier": tier,
         "ticks_since_last_action": scheduled.ticks_since_last_action,
         "harmonic_state": harmonic_data,
         "recent_events": recent_events,
     }
 
-    # --- Curvature-driven truncation gradient ---
-    # Calm (urgency < 0.3): full depth
-    # Moderate (0.3-0.7): trim deep history, keep recent
-    # Crisis (urgency > 0.7): strip to essentials
-
+    # --- Curvature-driven truncation gradient (Tier 0 only) ---
     if urgency < 0.7:
-        # Dialogue history — trimmed under moderate urgency
         history_depth = max(1, int(len(memory.verbatim) * (1.0 - urgency)))
         if memory.verbatim:
             block["dialogue_history"] = memory.verbatim[-history_depth:]
 
     if urgency < 0.5:
-        # Compressed history and distant memories — dropped under pressure
         if memory.compressed:
             block["compressed_history"] = memory.compressed
         if memory.keywords:
             block["distant_memories"] = memory.keywords
 
     if urgency < 0.7:
-        # Private knowledge — dropped under crisis
         if fact_pool is not None:
-            fact_limit = TIER_FACT_LIMITS.get(scheduled.tier, 2)
+            fact_limit = TIER_FACT_LIMITS.get(tier, 2)
             all_present = ["Player"] + list(present_ids)
             private_facts = fact_pool.query_private(
                 agent_id, all_present, limit=fact_limit,
@@ -408,8 +460,7 @@ def _build_agent_block(
             if private_facts:
                 block["private_knowledge"] = [f.content for f in private_facts]
 
-    # State history from Qdrant — always included if available
-    # (remindings are already curated by the retrieval pipeline)
+    # State history from Qdrant (Tier 0 only)
     if memory_bundle is not None:
         state_history: dict[str, Any] = {}
         if memory_bundle.recent:
@@ -421,11 +472,10 @@ def _build_agent_block(
         if state_history:
             block["state_history"] = state_history
 
-    # Active task — always included (the agent needs to know its goal)
     if buf and buf.active_task:
         block["active_task"] = buf.active_task
 
-    # Emotional dynamics — always included (curvature/snap/tension)
+    # Emotional dynamics — full at Tier 0
     if emotional_deltas is not None:
         delta = emotional_deltas.get(agent_id)
         if delta is not None:
@@ -441,12 +491,14 @@ def _build_agent_block(
 def _build_harmonic_data(
     agent_id: str,
     harmonic_state: "HarmonicState | None",
+    tier: int = 0,
 ) -> dict[str, Any]:
-    """Extract full harmonic buffer data for an agent's private block.
+    """Extract harmonic buffer data scaled by tier.
 
-    Includes all three buffer tiers (fast/medium/slow) — the agent's
-    full internal emotional state. Medium and slow are private; only
-    the fast trace is shared in the group display.
+    Tier 0 (Full): base_vector + all three buffer tiers (fast/medium/slow).
+        The agent's full internal emotional state.
+    Tier 1 (Abbreviated): base_vector + curvature scalar. No buffer traces.
+    Tier 2+ (Minimal/Stub): base_vector only.
     """
     if harmonic_state is None:
         return {"base_vector": list(ZERO_SEMAGRAM)}
@@ -455,10 +507,24 @@ def _build_harmonic_data(
     if buf is None or not buf._initialized:
         return {"base_vector": list(ZERO_SEMAGRAM)}
 
+    fast_list = [round(v, 4) for v in buf.fast.tolist()]
+
+    # Tier 2+: base_vector only
+    if tier >= 2:
+        return {"base_vector": fast_list}
+
+    # Tier 1: base_vector + curvature (lightweight dynamics indicator)
+    if tier == 1:
+        data: dict[str, Any] = {"base_vector": fast_list}
+        if buf._last_delta is not None:
+            data["curvature"] = round(buf._last_delta.curvature, 4)
+        return data
+
+    # Tier 0: full buffer traces
     return {
-        "base_vector": [round(v, 4) for v in buf.fast.tolist()],
+        "base_vector": fast_list,
         "buffers": {
-            "fast": [round(v, 4) for v in buf.fast.tolist()],
+            "fast": fast_list,
             "medium": [round(v, 4) for v in buf.medium.tolist()],
             "slow": [round(v, 4) for v in buf.slow.tolist()],
         },

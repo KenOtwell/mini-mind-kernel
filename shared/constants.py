@@ -42,6 +42,22 @@ ACTOR_VALUE_RANGES: dict[str, tuple[int, int, str]] = {
 }
 
 
+# Mood enum → EMOTIONAL_AXES index mapping.
+# Skyrim Mood enum: 0=Neutral 1=Anger 2=Fear 3=Happy 4=Sad
+#                   5=Surprised 6=Puzzled 7=Disgusted
+# Maps to the axis that Mood biases toward (or None for Neutral/unmapped).
+MOOD_TO_AXIS: dict[int, int | None] = {
+    0: None,   # Neutral — no axis bias
+    1: 1,      # Anger → anger axis
+    2: 0,      # Fear → fear axis
+    3: 6,      # Happy → joy axis
+    4: 5,      # Sad → sadness axis
+    5: 4,      # Surprised → excitement axis
+    6: None,   # Puzzled — no clean axis mapping
+    7: 3,      # Disgusted → disgust axis
+}
+
+
 # ---------------------------------------------------------------------------
 # SKSE Event Types
 # ---------------------------------------------------------------------------

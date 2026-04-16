@@ -32,9 +32,80 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from shared.constants import EMOTIONAL_DIM, ZERO_SEMAGRAM
+from shared.constants import EMOTIONAL_DIM, MOOD_TO_AXIS, ZERO_SEMAGRAM
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Dynamic modulator tuning constants
+# ---------------------------------------------------------------------------
+
+# Aggression: gain multiplier on anger (dim 1) and excitement (dim 4) axes.
+# Fast alpha scales UP (tracks anger/excitement faster when provoked).
+# Slow alpha scales DOWN (anger/excitement decay slower — slow to cool off).
+K_AGG: float = 0.4
+K_AGG_PERSIST: float = 0.3
+_AGG_AXES: tuple[int, int] = (1, 4)  # anger, excitement
+
+# Confidence: damping on fear (dim 0) effective delta magnitude.
+# At Confidence=4 (Foolhardy), fear deltas attenuated to ~20% of raw.
+K_CONF: float = 0.8
+_CONF_AXES: tuple[int, ...] = (0,)  # fear
+
+# Mood: ambient bias pull strength and target value.
+# Gentle drift — doesn't override strong events, just nudges during calm.
+DEFAULT_MOOD_PULL: float = 0.03
+MOOD_BIAS_VALUE: float = 0.3  # target value on the biased axis
+
+
+@dataclass
+class DynamicModulators:
+    """Engine preset values as dynamic modulators for harmonic buffer physics.
+
+    These shape HOW emotional signals propagate — gains, dampings, biases,
+    thresholds — not WHERE the agent sits in emotional space. Two NPCs
+    receiving identical events diverge immediately because the same stimulus
+    propagates differently through differently-tuned dynamics.
+
+    Constructed from Creation Engine actor values via build_modulators().
+    See Living Doc §Engine Preset Values as Dynamic Modulators.
+    """
+    aggression_gain: float = 0.0      # 0.0-1.0, from normalize(Aggression, 0, 3)
+    confidence_damp: float = 0.0      # 0.0-1.0, from normalize(Confidence, 0, 4)
+    morality_threshold: int = 3       # 0-3 integer (for response_expander action filtering)
+    mood_axis: int | None = None      # EMOTIONAL_AXES index, or None (Neutral/Puzzled)
+    mood_pull: float = 0.0            # ambient drift strength
+    assistance_coupling: float = 0.0  # 0.0-1.0, for future cross-agent bleed
+
+
+def build_modulators(
+    aggression: int = 0,
+    confidence: int = 2,
+    morality: int = 3,
+    mood: int = 0,
+    assistance: int = 0,
+) -> DynamicModulators:
+    """Construct DynamicModulators from raw Creation Engine actor values.
+
+    Normalizes integer ranges to [0, 1] floats for the continuous
+    modulator parameters. Mood maps to an axis index via MOOD_TO_AXIS.
+
+    Args:
+        aggression: 0=Unaggressive .. 3=Frenzied
+        confidence: 0=Cowardly .. 4=Foolhardy
+        morality:   0=Any crime .. 3=No crime
+        mood:       0=Neutral .. 7=Disgusted
+        assistance: 0=Nobody .. 2=Friends and allies
+    """
+    mood_axis = MOOD_TO_AXIS.get(mood)
+    return DynamicModulators(
+        aggression_gain=max(0.0, min(1.0, aggression / 3.0)),
+        confidence_damp=max(0.0, min(1.0, confidence / 4.0)),
+        morality_threshold=max(0, min(3, morality)),
+        mood_axis=mood_axis,
+        mood_pull=DEFAULT_MOOD_PULL if mood_axis is not None else 0.0,
+        assistance_coupling=max(0.0, min(1.0, assistance / 2.0)),
+    )
 
 
 @dataclass
@@ -94,9 +165,10 @@ class HarmonicBuffer:
     Zero-init: all traces start at zero. First update sets initial values.
 
     Per-axis EMA rates (_alpha_fast/medium/slow) are 9d vectors, initialized
-    from the scalar config defaults. Future dynamic modulators can adjust
-    individual axes to implement Aggression gain, Confidence damping, Mood
-    bias, etc. — see Living Doc §Engine Preset Values as Dynamic Modulators.
+    from the scalar config defaults. Dynamic modulators adjust individual
+    axes: Aggression gain on anger/excitement, Confidence damping on fear,
+    Mood bias pull, etc. See Living Doc §Engine Preset Values as Dynamic
+    Modulators.
     """
     fast: np.ndarray = field(default_factory=lambda: np.zeros(EMOTIONAL_DIM, dtype=np.float32))
     medium: np.ndarray = field(default_factory=lambda: np.zeros(EMOTIONAL_DIM, dtype=np.float32))
@@ -115,12 +187,60 @@ class HarmonicBuffer:
     prev_curvature: float = 0.0
     _initialized: bool = False
     _last_delta: EmotionalDelta | None = field(default=None, repr=False)
+    _modulators: DynamicModulators | None = field(default=None, repr=False)
+
+    def apply_modulators(self, mods: DynamicModulators) -> None:
+        """Apply engine preset dynamic modulators to per-axis EMA rates.
+
+        Adjusts the physics of emotional signal propagation:
+        - Aggression: anger/excitement axes track faster (fast α up)
+          and decay slower (slow α down). Asymmetric: easy to wind up,
+          slow to cool off.
+        - Confidence damping and mood pull are applied per-tick in
+          update(), not as alpha adjustments.
+
+        Safe to call multiple times — resets to config defaults first.
+        """
+        self._modulators = mods
+
+        # Reset alphas to config defaults before applying modulators.
+        self._alpha_fast[:] = _config.alpha_fast
+        self._alpha_medium[:] = _config.alpha_medium
+        self._alpha_slow[:] = _config.alpha_slow
+
+        # Aggression: anger (dim 1) and excitement (dim 4) axes.
+        # Fast alpha UP = tracks provocation faster.
+        # Slow alpha DOWN = anger/excitement persist longer.
+        if mods.aggression_gain > 0.0:
+            for ax in _AGG_AXES:
+                self._alpha_fast[ax] = min(
+                    1.0,
+                    _config.alpha_fast * (1.0 + mods.aggression_gain * K_AGG),
+                )
+                self._alpha_slow[ax] = max(
+                    0.01,
+                    _config.alpha_slow * (1.0 - mods.aggression_gain * K_AGG_PERSIST),
+                )
+
+        logger.debug(
+            "Modulators applied: agg=%.2f conf=%.2f mood_ax=%s mood_pull=%.3f",
+            mods.aggression_gain, mods.confidence_damp,
+            mods.mood_axis, mods.mood_pull,
+        )
 
     def update(self, new_semagram: list[float] | np.ndarray) -> EmotionalDelta:
         """Update all three EMA traces with a new 9d semagram.
 
         On first call, sets all traces to the new semagram directly
         (zero-init pattern: first delta IS initial values).
+
+        Dynamic modulator effects applied during the update:
+        - Confidence damping: fear delta attenuated before buffer update.
+          Raw delta preserved for Qdrant storage; only the buffer sees
+          the damped value. The memory remembers the real fear; the mind
+          just doesn't dwell on it.
+        - Mood pull: gentle ambient drift on the mood-biased axis after
+          the EMA step. Nudges, doesn't override.
 
         Returns an EmotionalDelta with the change signals.
         """
@@ -135,11 +255,36 @@ class HarmonicBuffer:
             self._initialized = True
             delta = new  # First delta is the full semagram
         else:
+            # Confidence damping: attenuate the effective delta on fear
+            # axes before the EMA step. The raw semagram is unchanged —
+            # Qdrant gets the real projection. Only the buffer update
+            # sees the damped input.
+            effective_new = new.copy()
+            if self._modulators is not None and self._modulators.confidence_damp > 0.0:
+                damp_factor = 1.0 - self._modulators.confidence_damp * K_CONF
+                for ax in _CONF_AXES:
+                    # Damp the magnitude of change on fear axes, not the
+                    # absolute value. A Foolhardy NPC still perceives the
+                    # fear stimulus; the signal is just attenuated.
+                    axis_delta = new[ax] - self.fast[ax]
+                    effective_new[ax] = self.fast[ax] + axis_delta * damp_factor
+
             # Per-axis EMA: trace[d] = α[d] * new[d] + (1 - α[d]) * trace[d]
             # Element-wise numpy multiplication handles all 9 axes at once.
-            self.fast = self._alpha_fast * new + (1 - self._alpha_fast) * self.fast
-            self.medium = self._alpha_medium * new + (1 - self._alpha_medium) * self.medium
-            self.slow = self._alpha_slow * new + (1 - self._alpha_slow) * self.slow
+            self.fast = self._alpha_fast * effective_new + (1 - self._alpha_fast) * self.fast
+            self.medium = self._alpha_medium * effective_new + (1 - self._alpha_medium) * self.medium
+            self.slow = self._alpha_slow * effective_new + (1 - self._alpha_slow) * self.slow
+
+            # Mood pull: gentle ambient drift toward mood bias value.
+            # Applied after the EMA step as a separate nudge. Small enough
+            # that strong events override it, but persistent during calm.
+            if self._modulators is not None and self._modulators.mood_axis is not None:
+                ax = self._modulators.mood_axis
+                pull = self._modulators.mood_pull
+                bias = MOOD_BIAS_VALUE
+                for trace in (self.fast, self.medium, self.slow):
+                    trace[ax] += pull * (bias - trace[ax])
+
             delta = self.fast - prev_fast
 
         # Curvature: magnitude of the delta (how fast is emotion changing?)
@@ -231,6 +376,16 @@ class HarmonicState:
         """Clear all buffers (session reset)."""
         self._buffers.clear()
         logger.info("Harmonic state reset — all agent buffers cleared")
+
+    def apply_modulators(self, agent_id: str, mods: DynamicModulators) -> None:
+        """Apply engine preset dynamic modulators to an agent's buffer.
+
+        Creates the buffer on first encounter (zero-init pattern).
+        Safe to call before the first update() — modulators are stored
+        and take effect on subsequent updates.
+        """
+        buf = self._get_or_create(agent_id)
+        buf.apply_modulators(mods)
 
     def remove_agent(self, agent_id: str) -> None:
         """Remove a specific agent's buffer."""

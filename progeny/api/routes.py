@@ -40,7 +40,7 @@ from progeny.src.llm_client import GenerateResult, LLMError
 from progeny.src import response_expander
 from progeny.src.memory_compressor import slide_window
 from progeny.src import emotional_delta
-from progeny.src.harmonic_buffer import HarmonicState
+from progeny.src.harmonic_buffer import HarmonicState, build_modulators
 from progeny.src.memory_writer import MemoryWriter
 from progeny.src.memory_retrieval import MemoryRetriever, MemoryBundle
 from progeny.src.compression import ArcCompressor, SceneCompressor, DEFAULT_SNAP_THRESHOLD
@@ -246,6 +246,56 @@ async def _fire_recognition_retrieval(
 
 
 # ---------------------------------------------------------------------------
+# Dynamic modulator application on NPC registration
+# ---------------------------------------------------------------------------
+
+def _apply_modulators_for_new_npcs(turn_context: TurnContext) -> None:
+    """Apply dynamic modulators for NPCs seen for the first time.
+
+    Checks each active NPC's agent buffer for addnpc events with parsed_data.
+    If the NPC doesn't yet have modulators on its harmonic buffer, constructs
+    modulators from the parsed registration data and applies them.
+
+    Currently: the addnpc wire event doesn't carry the 5 behavioral actor
+    values (Aggression, Confidence, Morality, Mood, Assistance) — this is a
+    known wire protocol gap. We apply default modulators (all-zero = uniform
+    dynamics) so the infrastructure is exercised. When the Papyrus extension
+    sends the values, they'll be extracted from parsed_data here.
+    """
+    for agent_id in turn_context.active_npc_ids:
+        buf = _harmonic_state._buffers.get(agent_id)
+        if buf is not None and buf._modulators is not None:
+            continue  # Already has modulators
+
+        # Look for addnpc parsed_data to extract actor values.
+        # Future: parsed_data will contain aggression, confidence, etc.
+        agent_buf = turn_context.agent_buffers.get(agent_id)
+        if agent_buf is None:
+            continue
+
+        for event in agent_buf.events:
+            if event.event_type == "addnpc" and event.parsed_data is not None:
+                pd = event.parsed_data
+                # Extract engine preset values when available in the wire data.
+                # For now, use defaults — the modulator infrastructure is
+                # exercised with uniform dynamics until the wire gap closes.
+                mods = build_modulators(
+                    aggression=int(pd.get("aggression", 0)),
+                    confidence=int(pd.get("confidence", 2)),
+                    morality=int(pd.get("morality", 3)),
+                    mood=int(pd.get("mood", 0)),
+                    assistance=int(pd.get("assistance", 0)),
+                )
+                _harmonic_state.apply_modulators(agent_id, mods)
+                logger.info(
+                    "Applied modulators for %s: agg=%.2f conf=%.2f mood=%s",
+                    agent_id, mods.aggression_gain, mods.confidence_damp,
+                    mods.mood_axis,
+                )
+                break  # One addnpc per agent is enough
+
+
+# ---------------------------------------------------------------------------
 # Per-group pipeline: prompt → LLM → expand
 # ---------------------------------------------------------------------------
 
@@ -364,6 +414,14 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
 
     # Record player input in dialogue history for all active agents
     _accumulator.record_player_input(turn_context.player_input)
+
+    # Apply dynamic modulators for newly registered NPCs.
+    # Modulators shape how emotional signals propagate through the buffer —
+    # aggression gain, confidence damping, mood pull, etc.
+    # Currently uses defaults since addnpc doesn't carry the 5 actor values
+    # (wire protocol gap — see Living Doc §Engine Preset Values). When the
+    # Papyrus extension sends values, extract them from parsed_data here.
+    _apply_modulators_for_new_npcs(turn_context)
 
     # Emotional pipeline: inbound text → 9d projection → update harmonic buffers
     emotional_delta.process_inbound(turn_context, _harmonic_state)

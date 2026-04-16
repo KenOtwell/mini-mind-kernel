@@ -525,10 +525,11 @@ POLINT = polling interval in seconds for `request` event type.
 * `curvature` (1st derivative) = rate of emotional change = the priority gradient over time. How fast the agent's emotional state is drifting right now. Curvature characterizes the *between-event* texture — the slow pressure building, the steady drift toward or away from danger.
 * `snap` (2nd derivative) = rate of change of curvature = the event boundary detector. When snap spikes, the *trajectory* changed — not just the position. Snap triggers arc storage, event boundary detection, and pre-interruption stashing. See Cognitive Model section.
 * `harmonic_buffers` (fast/medium/slow) = three timescale traces of the FULL 9d semagram. Each buffer holds a complete 9d vector — all 8 emotional axes + residual — decayed at its characteristic rate.
-    * `fast` (τ ≈ 3-5 ticks) — reactive surface. Tracks the agent's immediate emotional+domain trajectory.
-    * `medium` (τ ≈ 15-25 ticks) — session texture. The felt quality of this encounter/conversation.
-    * `slow` (τ ≈ 50-100 ticks) — personality substrate. The deep background pattern that barely moves.
-* **Update rule** (per tick, for each buffer tier): `buffer_t = α_t · new_semagram + (1 - α_t) · buffer_t` — exponential moving average. α_t (decay rate) is a per-agent personality parameter per tier. Fast α is large (tracks closely), slow α is small (remembers deeply).
+    * `fast` (half-life=5s) — reactive surface. Tracks the agent's immediate emotional+domain trajectory. The flinch. Fades in seconds without reinforcement.
+    * `medium` (half-life=8s) — decision texture. What the situation resolved to after processing. The mood of the encounter.
+    * `slow` (half-life=16s) — personality substrate. The deep background pattern that barely moves. Identity-level drift.
+* **Update rule** (per event): `buffer_t = α_t · new_semagram + (1 - α_t) · buffer_t` — exponential moving average. α_t (tracking rate) is a per-agent per-axis parameter. Fast α is large (tracks closely), slow α is small (remembers deeply). Per-axis modulation via engine preset modulators (see below).
+* **Autonomous temporal decay** (implemented April 2026) — traces regress toward zero based on elapsed wall-clock time when no new events arrive: `trace *= 0.5^(Δt / half_life)`. This is continuous-time decay, not tick-based. An NPC who drops to Tier 3 cadence (every 16th tick) settles naturally rather than freezing at combat emotions for minutes. Mood pull continues during cooling — disposition persists even without stimulus. Half-lives are direct tuning knobs in `HarmonicConfig`.
 * **Cross-buffer coherence** = agreement across the three timescales, computed per dimension and overall:
     ```
     coherence[dim] = 1 - normalized_var(fast[dim], medium[dim], slow[dim])
@@ -583,7 +584,8 @@ Mood is the closest to a true set-point — but only on a single axis. It biases
 * Modulates: EMA target on the mood-corresponding axis (not zero, but `mood_bias[axis]`)
 * Update rule for the biased axis: `buffer_t[axis] = α_t · new_semagram[axis] + (1 - α_t) · (buffer_t[axis] + mood_pull * (mood_bias[axis] - buffer_t[axis]))`
 * `mood_pull` is small (~0.01-0.05) — a gentle ambient drift, not a hard anchor
-* Maps Skyrim's integer mood enum to the corresponding semagram axis: Anger→anger, Fear→fear, Happy→joy, Sad→sadness, Disgusted→disgust, etc.
+* Maps Skyrim's integer mood enum to the corresponding semagram axis: Anger→anger, Fear→fear, Happy→joy, Sad→sadness, Surprised→excitement, Disgusted→disgust, Puzzled→residual (dim 8).
+* Puzzled maps to the residual axis — the "signal the model couldn't decompose into the primary emotional axes." Combined with LLM uncertainty feedback (see below), this creates a meaningful confusion state: uncertain model → attenuated residual → Puzzled mood pull nudges it back up → the NPC holds a confused-but-present state.
 * Neutral (0) = no bias on any axis = the default zero-target behavior
 
 **Assistance** (0=Nobody → 2=Friends and allies) → **Social binding strength / emotional bleed coefficient.**
@@ -615,9 +617,13 @@ The Zero-Init Pattern (see above) states that all agent state defaults to zero. 
 
 Zero-Init becomes: "Born at emotional zero, but with your own physics." Two NPCs receiving identical first events will diverge immediately — not because they started at different positions, but because the same stimulus propagates differently through their differently-tuned feedback dynamics. Lydia's Confidence=3 damping means her fear buffer barely moves; a Cowardly merchant's fear buffer spikes hard. Same input, different transfer function, divergent trajectories from tick 1.
 
-#### Wire Protocol Gap and Implementation
+#### Implementation Status (April 2026)
 
-**Current state**: The `addnpc` event (43+ fields) carries skills, equipment, stats, factions, and class — but NOT the 5 behavioral actor values. These values exist on every NPC in the Creation Engine but aren't included in the SKSE plugin's registration payload.
+**Implemented**: `DynamicModulators` dataclass and `build_modulators()` constructor in `harmonic_buffer.py`. `MOOD_TO_AXIS` mapping in `shared/constants.py`. Aggression gain on anger/excitement axes, confidence damping on fear delta, mood ambient drift, morality threshold storage, assistance coupling coefficient. Applied via `HarmonicBuffer.apply_modulators()` on NPC registration. Comprehensive test coverage including the Joker profile emergent behavior test. Prompt tier-scaling (T0 full, T1 abbreviated, T2 minimal, T3 stub) implemented in `prompt_formatter.py`.
+
+#### Wire Protocol Gap
+
+**Current state**: The `addnpc` event (43+ fields) carries skills, equipment, stats, factions, and class — but NOT the 5 behavioral actor values.
 
 **Options to acquire**:
 1. **Papyrus script at registration** — Add a small Papyrus script that reads `GetActorValue("Aggression")` etc. on NPC load and fires a custom ModEvent or appends to the `addnpc` payload. Requires a companion `.psc` script similar to `MMKSetBehavior.psc`. Cleanest approach — one-time read per NPC, shipped with the NPC metadata.
@@ -649,13 +655,47 @@ This extends the Tuning Knobs Model (see Fast-Twitch / Slow-Twitch Decoupling) i
 
 Each memory point stores TWO named vectors in Qdrant:
 * `semantic` (384d, all-MiniLM) — *what* happened (text content embedding)
-* `emotional` (9d, harmonics basis) — the emotional **delta** at encoding time (*what changed*, not absolute state)
+* `emotional` (9d, harmonics basis) — the NPC's **reaction** to the event (deviation from personality baseline)
 
-**Why the delta, not the absolute state:** The delta captures novelty — the surprise, the causal information, the thing that makes this event worth remembering. Storing absolute state means retrieval finds "times when I felt like this." Storing the delta means retrieval finds "times when *this kind of shift* happened." The delta is almost always the salient signal for causal reasoning: "I suddenly felt afraid" retrieves other sudden-fear events, while "I was afraid" retrieves everything that happened while afraid — swamping the signal with context.
+#### The Second-Thought Ritual (April 2026)
 
-Similarity search on the emotional delta vector = **shift-congruent memory recall**: agents retrieve memories where similar kinds of emotional change occurred, not just similar emotional states. This produces "this feels like that time when..." associations based on the *shape* of the transition, not the *position* in emotional space.
+The emotional vector stored with each memory is the NPC's *reaction* (fast - slow: deviation from personality baseline), not the text's raw emotional projection. This means the same text gets different emotional keys for different NPCs. A guard saying "great day for a hanging" gets stored with excitement in the guard's memories and dread in the prisoner's memories — because the emotional key captures how each NPC *reacted*, not what the words *expressed*.
 
-Retrieval blends both axes via Qdrant `prefetch` + `FusionQuery(RRF)`. Emotional intensity bias: high arousal shifts weight toward emotional axis, calm states bias toward semantic axis.
+The semantic axis (384d) is always computed from the text content — "what was said" is objective. The emotional axis (9d) is subjective — "how it landed" depends on who heard it.
+
+`qdrant_wrapper.ingest()` accepts an `emotional_override` parameter. The pipeline in `routes.py` captures each NPC's deviation after `process_inbound()` and passes it as the emotional vector for their memory writes.
+
+#### K/Q Retrieval Model (April 2026)
+
+Memory retrieval uses an asymmetric K/Q model inspired by cross-attention:
+* **Key (K)** = stored emotional reaction (deviation at write time) — "how this situation landed"
+* **Query (Q)** = current deviation: fast - slow — "what's unusual for me right now"
+* **Match** = Q·K finds memories where the NPC's current unusual state matches past reactions
+
+This solves the chronic-state problem: a chronically fearful NPC (high slow[0]) doesn't retrieve fear-memories every tick. Only when fear *exceeds* their baseline does the deviation vector point toward fear, surfacing memories of past situations where fear exceeded their norm.
+
+When the NPC is near baseline (small deviation), the emotional query is weak and λ(t) naturally shifts weight to the semantic axis. Calm NPCs retrieve by *content relevance*, not emotional resonance.
+
+Retrieval blends both axes via λ(t) weighting. Emotional intensity bias: high arousal shifts weight toward emotional axis, calm states bias toward semantic axis.
+
+### LLM Uncertainty as Cognitive Proprioception
+
+*Insight documented April 2026. Lineage: Ken Ong (theory — residual as certainty-modulated reality signal), Oz (mechanism — logprob extraction, structural filtering, EMA smoothing).*
+
+The LLM's token-level entropy is the one cognitive signal it doesn't have to simulate — it's genuinely experiencing uncertainty when the probability distribution flattens. This module captures that signal and feeds it back into the NPC's harmonic buffer as cognitive proprioception.
+
+**Mechanism:**
+1. llama.cpp returns pre-sampling `logprobs` per generated token (requested via `logprobs: true` in the chat completion payload).
+2. `uncertainty.py` segments the token sequence by agent response boundaries in the JSON output, then computes per-agent certainty: `certainty = exp(mean_logprob)` over semantic tokens only. Structural JSON tokens (brackets, field names, punctuation) are filtered out — they're grammar-forced and carry no uncertainty signal.
+3. The certainty factor (0–1) modulates the residual axis (dim 8) of incoming semagrams: `effective_new[8] *= certainty`. Full certainty preserves the reality signal; uncertainty attenuates it. Emotional axes (0–7) are unaffected.
+4. The LLM harmonics blend (Pass 2 emotional correction) is scaled per-agent by certainty: uncertain model → lower blend → defer to the mechanical pipeline. Prevents confabulated emotional corrections from poisoning the buffer.
+5. Certainty is EMA-smoothed (α=0.3) to prevent a single uncertain tick from crashing the residual.
+
+**The emergence chain:** Real model uncertainty → attenuated residual → emotional axes relatively dominate → NPC appears confused (visible in group display) → other NPCs react to the confusion → resolution through interaction. Nobody scripts "be confused" — the model literally *was* confused, and that propagated into the world.
+
+**Residual as certainty-modulated reality signal:** The residual (dim 8) captures non-emotional content — the "reality bits" left after orthogonal emotional projection. Modulating its gain by certainty treats it like a positional encoding: proportional relationships within the residual are preserved, only the overall gain changes. "I'm only half sure about the factual content" → multiply residual by 0.5. The NPC doesn't lose half its reality model — it holds all of it at half-conviction.
+
+Implementation: `progeny/src/uncertainty.py`, `HarmonicBuffer._certainty` + `set_certainty()`, `_apply_llm_harmonics()` per-agent blend scaling in `routes.py`.
 
 ### Arc Emotional Compression (MOD/MAX Tier Storage)
 

@@ -506,3 +506,225 @@ class TestDynamicModulators:
         # Anger and excitement should be strong (aggression gain)
         assert anger_val > 0.2
         assert excitement_val > 0.2
+
+
+# ---------------------------------------------------------------------------
+# Certainty modulation — LLM uncertainty → residual axis gain
+# ---------------------------------------------------------------------------
+
+class TestCertaintyModulation:
+    """Test that certainty factor modulates the residual axis (dim 8).
+
+    The LLM's genuine uncertainty (from token entropy) scales the residual
+    axis of incoming semagrams. Full certainty preserves the signal;
+    uncertainty attenuates it. Proportional relationships are preserved —
+    only the gain changes. When uncertainty drops the residual, emotional
+    axes relatively dominate the buffer: the NPC becomes more reactive,
+    less grounded. Recovery is natural via EMA smoothing.
+    """
+
+    def test_default_certainty_is_one(self):
+        """New buffers have full certainty (no modulation)."""
+        buf = HarmonicBuffer()
+        assert buf._certainty == 1.0
+
+    def test_set_certainty_ema_smoothed(self):
+        """Certainty is EMA-smoothed, not instantly overwritten."""
+        buf = HarmonicBuffer()
+        assert buf._certainty == 1.0  # default
+        # Setting to 0.0: EMA blend = 0.3 * 0.0 + 0.7 * 1.0 = 0.7
+        buf.set_certainty(0.0)
+        assert buf._certainty == pytest.approx(0.7, abs=0.01)
+        # Again: 0.3 * 0.0 + 0.7 * 0.7 = 0.49
+        buf.set_certainty(0.0)
+        assert buf._certainty < 0.7  # Continuing to drop
+
+    def test_set_certainty_clamped_before_ema(self):
+        """Out-of-range values are clamped before EMA blending."""
+        buf = HarmonicBuffer()
+        buf.set_certainty(1.5)  # clamped to 1.0, blended with 1.0 = 1.0
+        assert buf._certainty == pytest.approx(1.0)
+        buf.set_certainty(-0.5)  # clamped to 0.0, blended
+        assert buf._certainty < 1.0  # moved toward 0
+
+    def test_full_certainty_preserves_residual(self):
+        """Certainty=1.0 → residual passes through unmodified."""
+        buf = HarmonicBuffer()
+        buf.set_certainty(1.0)
+        sem = [0.0] * EMOTIONAL_DIM
+        sem[8] = 0.5  # residual
+        buf.update(sem)
+        # Fast trace should reflect full residual (first update = direct set)
+        assert buf.fast[8] == pytest.approx(0.5, abs=0.001)
+
+    def test_low_certainty_attenuates_residual(self):
+        """Low certainty → residual enters buffer at reduced strength."""
+        buf_full = HarmonicBuffer()
+        buf_full._certainty = 1.0  # bypass EMA for deterministic test
+        buf_low = HarmonicBuffer()
+        buf_low._certainty = 0.3   # direct set: 30% certainty
+
+        # Initialize both with zero, then hit with residual
+        neutral = [0.0] * EMOTIONAL_DIM
+        t0 = 100.0
+        buf_full.update(neutral, now=t0)
+        buf_low.update(neutral, now=t0)
+
+        sem = [0.0] * EMOTIONAL_DIM
+        sem[8] = 0.8  # strong residual
+        buf_full.update(sem, now=t0)
+        buf_low.update(sem, now=t0)
+
+        # Low-certainty buffer should have less residual
+        assert buf_low.fast[8] < buf_full.fast[8]
+        # At 30% certainty, the residual signal is heavily attenuated
+        ratio = buf_low.fast[8] / buf_full.fast[8] if buf_full.fast[8] > 0 else 0
+        assert ratio < 0.5  # Meaningfully attenuated
+
+    def test_zero_certainty_suppresses_residual(self):
+        """Certainty=0.0 → residual zeroed, emotions dominate."""
+        buf = HarmonicBuffer()
+        buf._certainty = 0.0  # direct set for deterministic test
+
+        neutral = [0.0] * EMOTIONAL_DIM
+        t0 = 100.0
+        buf.update(neutral, now=t0)
+
+        sem = [0.1, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9]
+        buf.update(sem, now=t0)
+
+        # Residual should be near zero (suppressed)
+        assert abs(buf.fast[8]) < 0.05
+        # But emotional axes should still be present
+        assert buf.fast[0] > 0.01  # fear
+        assert buf.fast[1] > 0.01  # anger
+
+    def test_certainty_does_not_affect_emotional_axes(self):
+        """Certainty modulation only touches dim 8, not dims 0-7."""
+        buf_full = HarmonicBuffer()
+        buf_full._certainty = 1.0
+        buf_low = HarmonicBuffer()
+        buf_low._certainty = 0.1  # direct set for deterministic test
+
+        neutral = [0.0] * EMOTIONAL_DIM
+        t0 = 100.0
+        buf_full.update(neutral, now=t0)
+        buf_low.update(neutral, now=t0)
+
+        sem = _angry_semagram()  # anger=0.8, fear=0.1, residual=0.3
+        buf_full.update(sem, now=t0)
+        buf_low.update(sem, now=t0)
+
+        # Emotional axes (0-7) should be identical regardless of certainty
+        for dim in range(8):
+            assert buf_full.fast[dim] == pytest.approx(buf_low.fast[dim], abs=1e-6), \
+                f"dim {dim} differs: {buf_full.fast[dim]} vs {buf_low.fast[dim]}"
+
+    def test_harmonic_state_set_certainty_forwarding(self):
+        """HarmonicState.set_certainty() forwards to per-agent buffer."""
+        state = HarmonicState()
+        state.set_certainty("Lydia", 0.42)
+        buf = state._buffers["Lydia"]
+        # EMA: 0.3 * 0.42 + 0.7 * 1.0 = 0.826
+        assert buf._certainty < 1.0
+        assert buf._certainty > 0.42  # Smoothed toward default
+
+
+# ---------------------------------------------------------------------------
+# Temporal decay (cooling) — autonomous regression without stimulus
+# ---------------------------------------------------------------------------
+
+class TestTemporalDecay:
+    """Test that traces decay proportional to elapsed time.
+
+    The cooling formula: trace *= exp(-α * Δt / τ)
+    Fast traces decay quickly. Slow traces barely move. Mood pull
+    continues during silence. All tested with explicit timestamps
+    to avoid flaky real-time dependencies.
+    """
+
+    def test_no_decay_without_time_elapsed(self):
+        """cool() with dt=0 does nothing."""
+        buf = HarmonicBuffer()
+        t0 = 100.0
+        buf.update(_angry_semagram(), now=t0)
+        fast_before = buf.fast.copy()
+        buf.cool(now=t0)  # dt = 0
+        np.testing.assert_allclose(buf.fast, fast_before)
+
+    def test_fast_decays_to_half_at_half_life(self):
+        """Fast trace decays to ~50% at its half-life (5s)."""
+        buf = HarmonicBuffer()
+        t0 = 100.0
+        buf.update(_angry_semagram(), now=t0)
+        fast_before = buf.fast[1]
+        # At half-life (5s): 0.5^(5/5) = 0.5
+        buf.cool(now=t0 + 5.0)
+        ratio = buf.fast[1] / fast_before if fast_before > 0 else 0
+        assert ratio == pytest.approx(0.5, abs=0.05)
+
+    def test_slow_barely_decays_in_short_time(self):
+        """Slow trace (half-life=16s) barely moves in 3 seconds."""
+        buf = HarmonicBuffer()
+        t0 = 100.0
+        buf.update(_angry_semagram(), now=t0)
+        slow_before = buf.slow[1]
+        # 3s: 0.5^(3/16) = 0.5^0.1875 ≈ 0.878
+        buf.cool(now=t0 + 3.0)
+        ratio = buf.slow[1] / slow_before if slow_before > 0 else 0
+        assert ratio > 0.85
+
+    def test_medium_decays_between_fast_and_slow(self):
+        """Medium trace decays at an intermediate rate."""
+        buf = HarmonicBuffer()
+        t0 = 100.0
+        buf.update(_angry_semagram(), now=t0)
+        fast_before = buf.fast[1]
+        medium_before = buf.medium[1]
+        slow_before = buf.slow[1]
+        buf.cool(now=t0 + 3.0)
+        fast_ratio = buf.fast[1] / fast_before if fast_before > 0 else 0
+        medium_ratio = buf.medium[1] / medium_before if medium_before > 0 else 0
+        slow_ratio = buf.slow[1] / slow_before if slow_before > 0 else 0
+        assert fast_ratio < medium_ratio < slow_ratio
+
+    def test_update_applies_cooling_automatically(self):
+        """update() calls cool() internally based on elapsed time."""
+        buf = HarmonicBuffer()
+        t0 = 100.0
+        buf.update(_angry_semagram(), now=t0)
+        anger_after_init = buf.fast[1]
+        # Update 5 seconds later with zero input — should see decay
+        # from cooling PLUS the EMA pull toward zero.
+        neutral = [0.0] * EMOTIONAL_DIM
+        buf.update(neutral, now=t0 + 5.0)
+        # Should be much less than original (both cooling and EMA)
+        assert buf.fast[1] < anger_after_init * 0.3
+
+    def test_mood_pull_during_cooling(self):
+        """Mood pull continues during silence — disposition persists."""
+        buf = HarmonicBuffer()
+        buf.apply_modulators(build_modulators(mood=3))  # Happy → joy (dim 6)
+        t0 = 100.0
+        # Initialize with neutral
+        buf.update([0.0] * EMOTIONAL_DIM, now=t0)
+        # Cool for 10 seconds without any events
+        buf.cool(now=t0 + 10.0)
+        # Joy axis should have drifted positive from mood pull
+        assert buf.fast[6] > 0.001
+
+    def test_cool_all_forwards_to_all_agents(self):
+        """HarmonicState.cool_all() applies to every buffer."""
+        state = HarmonicState()
+        t0 = 100.0
+        state.update("Lydia", _angry_semagram())
+        state.update("Mikael", _calm_semagram())
+        # Manually set timestamps for deterministic test
+        state._buffers["Lydia"]._last_ts = t0
+        state._buffers["Mikael"]._last_ts = t0
+        lydia_before = state._buffers["Lydia"].fast[1]
+        mikael_before = state._buffers["Mikael"].fast[6]
+        state.cool_all(now=t0 + 5.0)
+        # Both should have decayed
+        assert state._buffers["Lydia"].fast[1] < lydia_before
+        assert state._buffers["Mikael"].fast[6] < mikael_before

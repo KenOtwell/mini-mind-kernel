@@ -272,3 +272,35 @@ class TestEndToEndModulatorsTierScaling:
         assert t0_size > t2_size
         # T0 should be at least 2x bigger than T3
         assert t0_size > 2 * t3_size
+
+    def test_certainty_modulates_residual_in_prompt_data(self):
+        """Uncertainty feeds back into the buffer → prompt reflects attenuated residual."""
+        state, ctx, roster = _setup_whiterun_scene()
+
+        # Set Lydia to half certainty, Belethor to full certainty
+        state.set_certainty("Lydia", 0.5)
+        state.set_certainty("Belethor", 1.0)
+
+        # Feed a semagram with strong residual to both
+        residual_heavy = [0.0] * EMOTIONAL_DIM
+        residual_heavy[8] = 0.8  # strong residual (reality content)
+        residual_heavy[1] = 0.3  # some anger for context
+        for name in ["Lydia", "Belethor", "Ysolda", "Heimskr"]:
+            state.update(name, residual_heavy)
+
+        # Build prompt — Lydia's residual should be attenuated vs Belethor's
+        deltas = {name: state.get_delta(name) for name in ctx.active_npc_ids}
+        messages = build_prompt(ctx, roster, harmonic_state=state,
+                                emotional_deltas=deltas)
+        json_part = messages[1]["content"].split("\n\n")[0]
+        data = json.loads(json_part)
+        agents = {a["agent_id"]: a for a in data["agents"]}
+
+        # Lydia (T0) has full buffers — check residual (dim 8)
+        lydia_base = agents["Lydia"]["harmonic_state"]["base_vector"]
+        # Belethor (T1) has base_vector
+        belethor_base = agents["Belethor"]["harmonic_state"]["base_vector"]
+
+        # Lydia's residual should be weaker than Belethor's
+        # (both got same input, but Lydia's certainty was 0.5)
+        assert lydia_base[8] < belethor_base[8]

@@ -28,6 +28,7 @@ update IS the initial value — no separate initialization needed.
 from __future__ import annotations
 
 import logging
+import time as _time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -114,6 +115,15 @@ class HarmonicConfig:
     alpha_fast: float = 0.7
     alpha_medium: float = 0.3
     alpha_slow: float = 0.1
+    # Per-trace half-life (seconds): time for a trace to decay to 50%
+    # of its value without new input. Direct tuning knobs.
+    # Decay formula: trace *= 0.5^(Δt / half_life)
+    half_life_fast: float = 5.0     # reactive: flinch fades in ~5s
+    half_life_medium: float = 8.0   # mood: decision-scale persistence
+    half_life_slow: float = 16.0    # personality: long ambient imprint
+    # Certainty EMA smoothing rate. Prevents a single uncertain tick
+    # from crashing the residual. 0.3 = 30% new + 70% previous.
+    certainty_alpha: float = 0.3
     # Cross-buffer coherence sensitivity — higher = more discriminating.
     # Controls how quickly coherence drops as buffer traces diverge.
     coherence_scale: float = 10.0
@@ -188,6 +198,75 @@ class HarmonicBuffer:
     _initialized: bool = False
     _last_delta: EmotionalDelta | None = field(default=None, repr=False)
     _modulators: DynamicModulators | None = field(default=None, repr=False)
+    # Certainty factor from LLM token entropy — modulates residual axis.
+    # 1.0 = fully confident (no modulation). 0.0 = total uncertainty
+    # (residual zeroed — reality signal suppressed, emotions dominate).
+    # EMA-smoothed: one uncertain tick doesn't crash the residual.
+    _certainty: float = 1.0
+    # Timestamp of last update or cool — for temporal decay.
+    _last_ts: float = field(default_factory=_time.monotonic)
+
+    def set_certainty(self, certainty: float) -> None:
+        """Set the certainty factor from LLM uncertainty estimation.
+
+        EMA-smoothed to prevent a single uncertain tick from crashing
+        the residual. The smoothing rate (certainty_alpha) controls
+        how fast certainty responds: 0.3 = 30% new + 70% previous.
+
+        Args:
+            certainty: Raw factor in [0, 1]. Clamped then smoothed.
+        """
+        raw = max(0.0, min(1.0, certainty))
+        alpha = _config.certainty_alpha
+        self._certainty = alpha * raw + (1.0 - alpha) * self._certainty
+
+    def cool(self, now: float | None = None) -> None:
+        """Autonomous temporal decay — emotions attenuate without stimulus.
+
+        Applies continuous-time exponential decay based on elapsed time
+        since the last update or cool. Each trace has its own half-life
+        (seconds to decay to 50%):
+
+            trace *= 0.5^(Δt / half_life)
+
+        Fast traces decay quickly (the flinch fades). Slow traces barely
+        move (the personality imprint holds). Mood pull continues during
+        silence — disposition doesn't need stimulus.
+
+        Half-lives are direct tuning knobs in HarmonicConfig:
+          fast=5s, medium=8s, slow=16s (defaults).
+        Per-axis alpha modulation (aggression, etc.) affects the EMA
+        update step, not the cooling rate — cooling is uniform per trace.
+
+        Args:
+            now: Current timestamp (monotonic seconds). Defaults to
+                 time.monotonic() if not provided.
+        """
+        if not self._initialized:
+            return  # Nothing to decay
+
+        if now is None:
+            now = _time.monotonic()
+        dt = now - self._last_ts
+        if dt <= 0.0:
+            return  # No time elapsed
+        self._last_ts = now
+
+        # Half-life decay: trace *= 0.5^(Δt / half_life)
+        # Equivalent to exp(-ln2 * Δt / half_life). One scalar per trace.
+        _LN2 = 0.6931471805599453
+        self.fast *= np.float32(np.exp(-_LN2 * dt / _config.half_life_fast))
+        self.medium *= np.float32(np.exp(-_LN2 * dt / _config.half_life_medium))
+        self.slow *= np.float32(np.exp(-_LN2 * dt / _config.half_life_slow))
+
+        # Mood pull continues during silence — ambient disposition
+        # persists even without external events.
+        if self._modulators is not None and self._modulators.mood_axis is not None:
+            ax = self._modulators.mood_axis
+            pull = self._modulators.mood_pull
+            bias = MOOD_BIAS_VALUE
+            for trace in (self.fast, self.medium, self.slow):
+                trace[ax] += pull * (bias - trace[ax])
 
     def apply_modulators(self, mods: DynamicModulators) -> None:
         """Apply engine preset dynamic modulators to per-axis EMA rates.
@@ -228,11 +307,15 @@ class HarmonicBuffer:
             mods.mood_axis, mods.mood_pull,
         )
 
-    def update(self, new_semagram: list[float] | np.ndarray) -> EmotionalDelta:
+    def update(self, new_semagram: list[float] | np.ndarray, now: float | None = None) -> EmotionalDelta:
         """Update all three EMA traces with a new 9d semagram.
 
         On first call, sets all traces to the new semagram directly
         (zero-init pattern: first delta IS initial values).
+
+        Applies temporal decay before the EMA step if time has elapsed
+        since the last update. This ensures traces regress naturally
+        even if updates are sparse (high-tier agents with low cadence).
 
         Dynamic modulator effects applied during the update:
         - Confidence damping: fear delta attenuated before buffer update.
@@ -244,6 +327,15 @@ class HarmonicBuffer:
 
         Returns an EmotionalDelta with the change signals.
         """
+        if now is None:
+            now = _time.monotonic()
+
+        # Temporal decay: cool traces proportional to elapsed time before
+        # applying the new input. Ensures sparse updates don't leave
+        # stale state — the buffer settles between inputs.
+        if self._initialized:
+            self.cool(now)
+
         new = np.asarray(new_semagram, dtype=np.float32)
         prev_fast = self.fast.copy()
 
@@ -253,13 +345,21 @@ class HarmonicBuffer:
             self.medium = new.copy()
             self.slow = new.copy()
             self._initialized = True
+            self._last_ts = now  # Anchor the timestamp
             delta = new  # First delta is the full semagram
         else:
+            # Certainty modulation: scale residual axis (dim 8) by the
+            # certainty factor. Preserves proportional relationships —
+            # only the gain changes. Uncertain model → weaker reality
+            # signal → emotional axes relatively dominate.
+            effective_new = new.copy()
+            if self._certainty < 1.0:
+                effective_new[8] *= self._certainty
+
             # Confidence damping: attenuate the effective delta on fear
             # axes before the EMA step. The raw semagram is unchanged —
             # Qdrant gets the real projection. Only the buffer update
             # sees the damped input.
-            effective_new = new.copy()
             if self._modulators is not None and self._modulators.confidence_damp > 0.0:
                 damp_factor = 1.0 - self._modulators.confidence_damp * K_CONF
                 for ax in _CONF_AXES:
@@ -352,7 +452,7 @@ class HarmonicState:
         return buf.update(new_semagram)
 
     def get_semagram(self, agent_id: str) -> list[float]:
-        """Return an agent's current emotional state.
+        """Return an agent's current emotional state (fast trace).
 
         Returns ZERO_SEMAGRAM if the agent has no buffer yet.
         """
@@ -360,6 +460,21 @@ class HarmonicState:
         if buf is None:
             return list(ZERO_SEMAGRAM)
         return buf.get_semagram()
+
+    def get_deviation(self, agent_id: str) -> list[float]:
+        """Return the emotional deviation from personality baseline.
+
+        Computes fast - slow: what's unusual for this NPC right now.
+        Used as the emotional query (Q) for memory retrieval.
+        A chronically fearful NPC doesn't retrieve fear-memories every
+        tick — only when fear exceeds their baseline.
+
+        Returns ZERO_SEMAGRAM if the agent has no buffer yet.
+        """
+        buf = self._buffers.get(agent_id)
+        if buf is None:
+            return list(ZERO_SEMAGRAM)
+        return (buf.fast - buf.slow).tolist()
 
     def get_delta(self, agent_id: str) -> EmotionalDelta | None:
         """Return the last EmotionalDelta for an agent, or None.
@@ -386,6 +501,29 @@ class HarmonicState:
         """
         buf = self._get_or_create(agent_id)
         buf.apply_modulators(mods)
+
+    def set_certainty(self, agent_id: str, certainty: float) -> None:
+        """Set LLM-derived certainty factor for an agent's buffer.
+
+        Modulates the residual axis (dim 8) on subsequent updates.
+        Creates the buffer on first encounter (zero-init pattern).
+        Called per-tick from the uncertainty pipeline after LLM generation.
+        """
+        buf = self._get_or_create(agent_id)
+        buf.set_certainty(certainty)
+
+    def cool_all(self, now: float | None = None) -> None:
+        """Apply temporal decay to all agent buffers.
+
+        Called at the start of each turn before emotional processing.
+        Agents that haven't received events since last turn settle
+        proportional to elapsed time — the flinch fades, the mood
+        persists, the personality holds.
+        """
+        if now is None:
+            now = _time.monotonic()
+        for buf in self._buffers.values():
+            buf.cool(now)
 
     def remove_agent(self, agent_id: str) -> None:
         """Remove a specific agent's buffer."""

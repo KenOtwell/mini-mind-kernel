@@ -40,22 +40,33 @@ async def ingest(
     event_type: str = "dialogue",
     tier: str = "RAW",
     extra_payload: Optional[dict[str, Any]] = None,
+    emotional_override: Optional[list[float]] = None,
 ) -> Optional[str]:
     """Embed text, project to 9d emotional semagram, write to Qdrant.
 
-    The single enrichment gate: text in → key out. Both vectors
-    (semantic 384d + emotional 9d) are computed here and stored with
-    the point. Callers never need to touch embeddings directly.
+    The single enrichment gate: text in → key out. Semantic vector
+    (384d) is always computed from the text. Emotional vector (9d)
+    defaults to the text's raw projection but can be overridden with
+    the NPC's reaction vector — the "second thought" ritual.
+
+    When emotional_override is provided, the stored emotional key
+    represents how the NPC *reacted* to the text, not what the text
+    *expressed*. This means the same text gets different emotional
+    keys for different NPCs: the prisoner's memory of "great day
+    for a hanging" is keyed by dread, not the guard's jovial tone.
 
     Args:
-        client:        Async Qdrant client (initialized by the service).
-        text:          Raw text to embed and store.
-        collection:    Qdrant collection name.
-        agent_id:      NPC or entity this text belongs to.
-        game_ts:       Skyrim game timestamp.
-        event_type:    Event classification (dialogue, speech, response, etc.).
-        tier:          Compression tier (RAW, MOD, MAX).
-        extra_payload: Additional metadata merged into the point payload.
+        client:             Async Qdrant client (initialized by the service).
+        text:               Raw text to embed and store.
+        collection:         Qdrant collection name.
+        agent_id:           NPC or entity this text belongs to.
+        game_ts:            Skyrim game timestamp.
+        event_type:         Event classification (dialogue, speech, response, etc.).
+        tier:               Compression tier (RAW, MOD, MAX).
+        extra_payload:      Additional metadata merged into the point payload.
+        emotional_override: 9d reaction vector to use instead of the text's
+                            raw emotional projection. Typically the NPC's
+                            deviation (fast - slow) after processing the text.
 
     Returns:
         Qdrant point ID (UUID string) on success, None on failure.
@@ -67,7 +78,10 @@ async def ingest(
     try:
         emb = embedding.embed_one(text)
         semantic_vec = emb.tolist()
-        emotional_vec = emotional.project(emb)
+        # Second-thought ritual: if the caller provides the NPC's reaction
+        # vector, use it as the emotional key. Otherwise, use the text's
+        # own emotional projection (what the words expressed).
+        emotional_vec = emotional_override if emotional_override is not None else emotional.project(emb)
     except Exception:
         logger.exception("Enrichment failed (embed/project) for %s event", event_type)
         return None

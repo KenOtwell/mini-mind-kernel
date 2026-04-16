@@ -53,7 +53,7 @@ MOOD_TO_AXIS: dict[int, int | None] = {
     3: 6,      # Happy → joy axis
     4: 5,      # Sad → sadness axis
     5: 4,      # Surprised → excitement axis
-    6: None,   # Puzzled — no clean axis mapping
+    6: 8,      # Puzzled → residual axis (certainty-modulated reality signal)
     7: 3,      # Disgusted → disgust axis
 }
 

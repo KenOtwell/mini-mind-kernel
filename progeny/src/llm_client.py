@@ -67,13 +67,20 @@ def configure(config: LLMConfig) -> None:
 
 @dataclass
 class GenerateResult:
-    """LLM response content + backend timing metadata."""
+    """LLM response content + backend timing metadata.
+
+    token_logprobs: per-token log probabilities from the LLM generation.
+    Each entry is a dict with 'token' (str) and 'logprob' (float).
+    None if the backend doesn't support logprobs or the request failed.
+    Used by the uncertainty module for per-agent certainty estimation.
+    """
     content: str
     prompt_tokens: int = 0
     prompt_ms: float = 0.0
     generated_tokens: int = 0
     generation_ms: float = 0.0
     cache_tokens: int = 0
+    token_logprobs: list[dict] | None = None
 
 
 async def generate(messages: list[dict[str, str]]) -> GenerateResult:
@@ -95,6 +102,11 @@ async def generate(messages: list[dict[str, str]]) -> GenerateResult:
         "temperature": profile.temperature,
         "top_p": profile.top_p,
         "stream": False,
+        # Request pre-sampling token log probabilities for uncertainty
+        # estimation. llama.cpp returns log(softmax(logits)) per token —
+        # the model's genuine confidence before sampling distorts it.
+        "logprobs": True,
+        "top_logprobs": 3,
     }
     if profile.supports_json_mode:
         payload["response_format"] = {"type": "json_object"}
@@ -136,10 +148,26 @@ async def generate(messages: list[dict[str, str]]) -> GenerateResult:
 
 
 def _build_result(content: str, data: dict) -> GenerateResult:
-    """Extract timing metadata from llama.cpp response."""
+    """Extract timing metadata and token logprobs from llama.cpp response."""
     # llama.cpp includes timings at top level; OpenAI-compat has usage
     timings = data.get("timings", {})
     usage = data.get("usage", {})
+
+    # Extract per-token logprobs from OAI-compatible response.
+    # Format: choices[0].logprobs.content = [{token, logprob, top_logprobs}, ...]
+    # Graceful fallback: None if backend doesn't support logprobs.
+    token_logprobs = None
+    choices = data.get("choices", [])
+    if choices:
+        logprobs_obj = choices[0].get("logprobs")
+        if isinstance(logprobs_obj, dict):
+            raw_content = logprobs_obj.get("content")
+            if isinstance(raw_content, list):
+                token_logprobs = [
+                    {"token": entry.get("token", ""), "logprob": entry.get("logprob", 0.0)}
+                    for entry in raw_content
+                    if isinstance(entry, dict)
+                ]
 
     return GenerateResult(
         content=content,
@@ -148,6 +176,7 @@ def _build_result(content: str, data: dict) -> GenerateResult:
         generated_tokens=timings.get("predicted_n", usage.get("completion_tokens", 0)),
         generation_ms=timings.get("predicted_ms", 0.0),
         cache_tokens=timings.get("cache_n", 0),
+        token_logprobs=token_logprobs,
     )
 
 

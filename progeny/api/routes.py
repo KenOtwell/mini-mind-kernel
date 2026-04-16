@@ -45,6 +45,7 @@ from progeny.src.memory_writer import MemoryWriter
 from progeny.src.memory_retrieval import MemoryRetriever, MemoryBundle
 from progeny.src.compression import ArcCompressor, SceneCompressor, DEFAULT_SNAP_THRESHOLD
 from progeny.src import qdrant_client as progeny_qdrant
+from progeny.src.uncertainty import compute_certainty
 from shared import embedding as shared_embedding
 from shared import emotional as shared_emotional
 
@@ -118,7 +119,10 @@ def _build_schedule_info(turn_context: TurnContext) -> list[NpcScheduleInfo]:
 # Two-pass emotional evaluation — LLM harmonics application
 # ---------------------------------------------------------------------------
 
-def _apply_llm_harmonics(responses: list[AgentResponse]) -> None:
+def _apply_llm_harmonics(
+    responses: list[AgentResponse],
+    certainty_map: dict[str, float] | None = None,
+) -> None:
     """Apply LLM-proposed updated_harmonics as Pass 2 emotional correction.
 
     Pass 1 (mechanical): text → embed → 9d projection → EMA update.
@@ -128,14 +132,20 @@ def _apply_llm_harmonics(responses: list[AgentResponse]) -> None:
         weighted by llm_harmonics_blend. This corrects for context the
         mechanical pipeline can't see (identity, history, stakes).
 
+    Per-agent certainty modulation: the blend weight is scaled by the
+    agent's certainty factor (from LLM token entropy). Uncertain model
+    → lower effective blend → defer to mechanical pipeline. The model's
+    own uncertainty about an NPC's situation prevents confabulated
+    emotional corrections from poisoning the buffer.
+
     The blend ensures the mechanical pipeline provides the baseline
     (honest but dumb) and the LLM provides the contextual correction
     (smart but potentially confabulated). Neither alone is sufficient.
     """
     from progeny.src.harmonic_buffer import _config as hb_config
 
-    blend = hb_config.llm_harmonics_blend
-    if blend <= 0.0:
+    base_blend = hb_config.llm_harmonics_blend
+    if base_blend <= 0.0:
         return  # LLM harmonics disabled
 
     applied = 0
@@ -146,6 +156,13 @@ def _apply_llm_harmonics(responses: list[AgentResponse]) -> None:
         proposed = resp.updated_harmonics.base_vector
         if len(proposed) != 9:
             continue
+
+        # Per-agent blend: scale by certainty factor.
+        # Uncertain model → lower blend → trust mechanical pipeline more.
+        certainty = 1.0
+        if certainty_map is not None:
+            certainty = certainty_map.get(resp.agent_id, 1.0)
+        blend = base_blend * certainty
 
         # Blend: weighted average of current state and LLM proposal.
         # new = (1 - blend) * current + blend * proposed
@@ -164,8 +181,8 @@ def _apply_llm_harmonics(responses: list[AgentResponse]) -> None:
 
     if applied:
         logger.info(
-            "Pass 2 emotional correction: %d agents updated via LLM harmonics (blend=%.2f)",
-            applied, blend,
+            "Pass 2 emotional correction: %d agents updated via LLM harmonics (base_blend=%.2f)",
+            applied, base_blend,
         )
 
 
@@ -415,6 +432,12 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
     # Record player input in dialogue history for all active agents
     _accumulator.record_player_input(turn_context.player_input)
 
+    # Temporal decay: cool all agent buffers proportional to elapsed time.
+    # Agents that haven't received events since last turn settle naturally.
+    # Must happen before emotional processing so the EMA update operates
+    # on decayed (settled) traces, not stale frozen state.
+    _harmonic_state.cool_all()
+
     # Apply dynamic modulators for newly registered NPCs.
     # Modulators shape how emotional signals propagate through the buffer —
     # aggression gain, confidence damping, mood pull, etc.
@@ -448,12 +471,21 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
             turn_context.active_npc_ids,
         )
 
-    # Persist inbound events to Qdrant via enrichment wrapper (RAW writes)
-    # Each event text gets embedded, projected to 9d, and stored with dual vectors.
+    # Persist inbound events to Qdrant via enrichment wrapper (RAW writes).
+    # Second-thought ritual: the emotional vector stored with each memory
+    # is the NPC's REACTION (deviation from baseline), not the text's raw
+    # emotional projection. The same text gets different emotional keys for
+    # different NPCs — the prisoner's memory of "great day for a hanging"
+    # is keyed by dread, not the guard's jovial tone. Semantic vector (384d)
+    # is still computed from the text content (what was said).
     # Non-blocking: failures are logged but don't stop the turn.
     try:
         qdrant_cli = progeny_qdrant.get_client()
         for agent_id, buf in turn_context.agent_buffers.items():
+            # Capture this NPC's emotional reaction for the second-thought key.
+            # get_deviation() returns fast - slow: what's unusual for this NPC
+            # right now, after processing all inbound events this tick.
+            reaction_vec = _harmonic_state.get_deviation(agent_id)
             for event in buf.events:
                 if event.raw_data:
                     await qdrant_wrapper.ingest(
@@ -463,6 +495,7 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
                         agent_id=agent_id,
                         game_ts=event.game_ts,
                         event_type=event.event_type,
+                        emotional_override=reaction_vec,
                     )
     except Exception as exc:
         logger.warning("RAW write pass failed (non-fatal): %s", exc)
@@ -499,10 +532,13 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
     # retrieval input by exactly one tick boundary.
     #
     # Semantic query: player's input embedding (what was said).
-    # Emotional query: agent's current delta (shift direction) for
-    # shift-congruent retrieval — "find events whose emotional content
-    # matches the direction I'm currently moving."
-    # NOTE: subject/object perspective inversion is an open research issue.
+    # Emotional query (K/Q model): Q = fast - slow (deviation from
+    # personality baseline). Retrieves memories whose emotional content
+    # matches what's *unusual* for this NPC right now, not just what
+    # they're feeling. A chronically fearful NPC doesn't retrieve fear-
+    # memories every tick — only when fear exceeds their baseline.
+    # When curvature is high (volatile), the delta (direction of change)
+    # is blended in to capture shift-congruent memories.
     try:
         if shared_embedding.is_loaded() and shared_emotional.is_loaded():
             player_emb = shared_embedding.embed_one(turn_context.player_input)
@@ -511,12 +547,9 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
                 agent_id = agent.agent_id
                 delta = emotional_deltas.get(agent_id)
                 lambda_t = delta.lambda_t if delta else 0.5
-                # Shift-congruent: use delta when curvature is meaningful,
-                # fall back to absolute state in calm periods.
-                if delta and delta.curvature > 0.01:
-                    emo_query = delta.delta
-                else:
-                    emo_query = _harmonic_state.get_semagram(agent_id)
+                # Q = fast - slow: deviation from personality baseline.
+                # What's unusual for this NPC right now.
+                emo_query = _harmonic_state.get_deviation(agent_id)
                 bundle = await _memory_retriever.retrieve_for_agent(
                     agent_id=agent_id,
                     semantic_query=semantic_query,
@@ -558,12 +591,31 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
     ]
     group_results = await asyncio.gather(*group_tasks)
 
-    # Step 5: Merge results in roster order
+    # Step 5: Merge results in roster order + extract uncertainty
     all_responses: list[AgentResponse] = []
     all_gen_results: list[GenerateResult | None] = []
-    for responses, gen_result in group_results:
+    all_certainty: dict[str, float] = {}
+    for (responses, gen_result), group in zip(group_results, groups):
         all_responses.extend(responses)
         all_gen_results.append(gen_result)
+
+        # Extract per-agent certainty from token logprobs.
+        # The model's genuine uncertainty about each NPC feeds back into
+        # the harmonic buffer (residual axis modulation) and scales the
+        # LLM harmonics blend (uncertain → defer to mechanical pipeline).
+        if gen_result is not None:
+            group_certainty = compute_certainty(
+                gen_result.token_logprobs, group.agent_ids,
+            )
+            all_certainty.update(group_certainty)
+            for agent_id, cert in group_certainty.items():
+                _harmonic_state.set_certainty(agent_id, cert)
+            if any(c < 0.9 for c in group_certainty.values()):
+                logger.info(
+                    "Uncertainty feedback for group %s: %s",
+                    group.label,
+                    {k: round(v, 3) for k, v in group_certainty.items()},
+                )
 
     # Record outputs into dialogue history (behavior adoption)
     # Also write utterances to Qdrant via enrichment wrapper and set utterance_key
@@ -614,7 +666,7 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
     # contextual reaction — how those words FELT given identity, history,
     # and current state. This closes the prisoner/guard gap.
     # The LLM-evaluated vector is blended into the buffer (not replacing it).
-    _apply_llm_harmonics(all_responses)
+    _apply_llm_harmonics(all_responses, certainty_map=all_certainty)
 
     # Arc compression: check snap threshold for each agent after emotional adoption.
     # If snap exceeds threshold, generate a MOD-tier arc summary from recent RAW points.

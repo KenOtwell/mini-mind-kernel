@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Any, Literal, Optional
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -360,8 +360,39 @@ class WorldState(BaseModel):
 # LLM response models — Progeny → Falcon contract
 # ---------------------------------------------------------------------------
 
+class Act(BaseModel):
+    """A single act — what the agent does to/with its environment.
+
+    Unifies effector (physical), perceptual (sensor/attention), and cognitive
+    (memory/reasoning) actions under one schema. No distinction is made
+    between internal and external acts for execution purposes: both externalize
+    the agent's intent into its environment (physical or mental).
+
+    group: Parallel execution group. Acts with the same group value run
+    concurrently via asyncio.gather(); different group values run in ascending
+    sequential order. Within a group, no act's output feeds another's input.
+    The LLM is responsible for grouping based on data dependency.
+
+    Examples:
+      # Parallel perceptual gather (group 0), then commit effector (group 1):
+      Act(name='SearchMemory', category='cognitive',
+          arguments={'query': 'Dragonborn'}, group=0)
+      Act(name='InspectSurroundings', category='perceptual',
+          arguments={'radius': 20.0}, group=0)
+      Act(name='Talk', category='effector',
+          arguments={'target': 'Dragonborn'}, group=1)
+    """
+    name: str
+    category: Literal["effector", "perceptual", "cognitive"] = "effector"
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    group: int = Field(
+        0, ge=0,
+        description="Parallel execution group. Same = parallel, ascending = sequential."
+    )
+
+
 class ActionCommand(BaseModel):
-    """A single action from the 43-command vocabulary."""
+    """Deprecated: use Act instead. Kept for backward compatibility."""
     command: str
     target: Optional[str] = None
     item: Optional[str] = None
@@ -389,6 +420,11 @@ class NewMemory(BaseModel):
 class AgentResponse(BaseModel):
     """Response for a single agent from the LLM turn.
 
+    acts: primary action output. Ordered parallel groups — acts with the same
+    group value execute concurrently; groups run in ascending sequential order.
+    Replaces the flat actions list with a unified effector/perceptual/cognitive
+    schema.
+
     utterance_key: if set, the utterance text was written to Qdrant via
     the enrichment wrapper and this is the point ID. Falcon reads the
     text by key for wire formatting. Falls back to inline utterance if
@@ -398,7 +434,11 @@ class AgentResponse(BaseModel):
     utterance: Optional[str] = None
     utterance_key: Optional[str] = None
     actor_value_deltas: Optional[ActorValueDeltas] = None
-    actions: list[ActionCommand] = Field(default_factory=list)
+    acts: list[Act] = Field(default_factory=list)
+    actions: list[ActionCommand] = Field(
+        default_factory=list,
+        description="Deprecated: use acts instead."
+    )
     updated_harmonics: Optional[UpdatedHarmonics] = None
     new_memories: list[NewMemory] = Field(default_factory=list)
     extraction_level: ExtractionLevel = ExtractionLevel.STRICT

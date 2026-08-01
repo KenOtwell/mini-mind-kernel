@@ -55,6 +55,7 @@ from progeny.src import social_goals
 from progeny.src import disclosure
 from progeny.src import memory_reconsolidation
 from progeny.src.goal_pool import GoalPool, GoalState, seed_goals
+from mindcore.goal import DEFAULT_ACTIVATION_FLOOR
 from progeny.src.goal_lifecycle import LifecycleStore
 from mindcore import embedding as shared_embedding
 from mindcore import emotional as shared_emotional
@@ -292,6 +293,9 @@ async def _prime_goals_for_turn(
         ):
             res.recall.append(social_node.statement)
 
+        # Reinforce: reset dopamine priming clock for the goal that fired this tick.
+        if res.top is not None and res.top.activation >= DEFAULT_ACTIVATION_FLOOR:
+            _goal_pool.reinforce(res.top.goal_id)
         if res.top is not None or transitions:
             logger.info(
                 "Goal priming: agent=%s top=%s act=%.3f dissonance=%.2f recall=%d transitions=%s",
@@ -1316,6 +1320,13 @@ async def _ingest_inner(package: TickPackage) -> TurnResponse | AckResponse:
 
     elapsed_ms = int((time.monotonic() - start_ms) * 1000)
     timings = _aggregate_timings(all_gen_results)
+
+    # Advance the dopamine experience counter for all active goals.
+    # Experience units = total tokens this tick; density = tokens/minute for this tick.
+    _tick_units = float(timings.prompt_tokens + timings.generated_tokens)
+    _tick_elapsed_min = max(elapsed_ms / 60000.0, 0.01)
+    _tick_density = _tick_units / _tick_elapsed_min
+    _goal_pool.accumulate_experience(units=_tick_units, density=_tick_density)
 
     logger.info(
         "Tick %s: turn complete in %dms, %d responses across %d groups "

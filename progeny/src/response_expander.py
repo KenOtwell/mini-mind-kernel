@@ -22,6 +22,7 @@ from typing import Any
 
 from shared.constants import ACTOR_VALUE_RANGES, COMMAND_VOCABULARY
 from shared.schemas import (
+    Act,
     AgentResponse,
     ActionCommand,
     ActorValueDeltas,
@@ -165,8 +166,11 @@ def _parse_agent_entry(entry: dict[str, Any]) -> AgentResponse:
     # Actor value deltas — validate and clamp
     avd = _parse_actor_value_deltas(entry.get("actor_value_deltas"))
 
-    # Actions — validate against command vocabulary
-    actions = _parse_actions(entry.get("actions", []))
+    # Acts (primary) — parallel-grouped unified action schema.
+    # Falls back to legacy "actions" field for backward compatibility with
+    # models that haven't been updated to the new schema.
+    acts = _parse_acts(entry.get("acts", []))
+    actions = _parse_actions(entry.get("actions", []))  # deprecated, kept for compat
 
     # Updated harmonics
     harmonics = _parse_harmonics(entry.get("updated_harmonics"))
@@ -178,6 +182,7 @@ def _parse_agent_entry(entry: dict[str, Any]) -> AgentResponse:
         agent_id=agent_id,
         utterance=utterance,
         actor_value_deltas=avd,
+        acts=acts,
         actions=actions,
         updated_harmonics=harmonics,
         new_memories=memories,
@@ -207,8 +212,50 @@ def _parse_actor_value_deltas(raw: Any) -> ActorValueDeltas | None:
     return ActorValueDeltas(**clamped)
 
 
+def _parse_acts(raw: Any) -> list[Act]:
+    """Parse the unified Act list (primary action schema).
+
+    Validates name against COMMAND_VOCABULARY for effector acts.
+    Perceptual and cognitive acts are accepted if they have a name.
+    Strips entries that are malformed or have unknown effector names.
+    """
+    if not isinstance(raw, list):
+        return []
+
+    acts = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name", "")
+        if not name:
+            continue
+        category = item.get("category", "effector")
+        if category not in ("effector", "perceptual", "cognitive"):
+            category = "effector"
+        # Effector acts are validated against the known vocabulary.
+        # Perceptual/cognitive acts are pass-through (open vocabulary).
+        if category == "effector" and name not in COMMAND_VOCABULARY:
+            logger.debug("Stripping unknown effector act: %s", name)
+            continue
+        arguments = item.get("arguments", {})
+        if not isinstance(arguments, dict):
+            arguments = {}
+        try:
+            group = int(item.get("group", 0))
+        except (ValueError, TypeError):
+            group = 0
+        acts.append(Act(
+            name=name,
+            category=category,
+            arguments=arguments,
+            group=max(0, group),
+        ))
+
+    return acts
+
+
 def _parse_actions(raw: Any) -> list[ActionCommand]:
-    """Validate actions against the 43-command vocabulary. Strip unknown."""
+    """Deprecated: parse legacy flat actions list. Use _parse_acts for new code."""
     if not isinstance(raw, list):
         return []
 

@@ -52,7 +52,19 @@ class MemoryWriter:
 
     All writes go through this class. Single write authority simplifies
     consistency and makes the write log auditable.
+
+    client: Optional AsyncQdrantClient injection. None (default) uses the
+    module-level Progeny singleton (get_client()). Pass an explicit client
+    to use MemoryWriter with any collection/database (e.g. Quantum's own
+    AsyncQdrantClient), enabling the portable reconsolidation engine.
     """
+
+    def __init__(self, client=None) -> None:
+        self._injected_client = client
+
+    def _get_client(self):
+        """Return injected client or fall back to Progeny singleton."""
+        return self._injected_client if self._injected_client is not None else get_client()
 
     # ------------------------------------------------------------------
     # RAW tier — immutable event log
@@ -99,7 +111,7 @@ class MemoryWriter:
             payload.update(extra_payload)
 
         try:
-            await get_client().upsert(
+            await self._get_client().upsert(
                 collection_name=COLLECTION_NPC_MEMORIES,
                 points=[
                     PointStruct(
@@ -309,6 +321,7 @@ class MemoryWriter:
         recon_stalled: bool = False,
         location: Optional[str] = None,
         point_id: Optional[str] = None,
+        collection: str = COLLECTION_NPC_MEMORIES,
     ) -> str:
         """Write a RECON-tier reconsolidated summary (sleep-time reinterpretation).
 
@@ -366,8 +379,8 @@ class MemoryWriter:
             "recon_stalled": recon_stalled,
         }
         try:
-            await get_client().upsert(
-                collection_name=COLLECTION_NPC_MEMORIES,
+            await self._get_client().upsert(
+                collection_name=collection,
                 points=[
                     PointStruct(
                         id=point_id,

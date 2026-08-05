@@ -13,7 +13,6 @@ from mindcore.constants import (  # noqa: F401
     EMOTIONAL_DIM,
     SEMANTIC_DIM,
     ZERO_SEMAGRAM,
-    MOOD_TO_AXIS,
 )
 
 
@@ -30,8 +29,19 @@ ACTOR_VALUE_RANGES: dict[str, tuple[int, int, str]] = {
     "Assistance": (0, 2, "0=Nobody 1=Allies 2=Friends and allies"),
 }
 
-
-# MOOD_TO_AXIS (cognitive) is imported from mindcore.constants above.
+# MOOD_TO_AXIS: Creation Engine mood enum integer → EMOTIONAL_AXES index.
+# Lives here (not in mindcore) because the integer codes are Skyrim-specific.
+# See mindcore/ARCHITECTURE.md.
+MOOD_TO_AXIS: dict[int, int | None] = {
+    0: None,   # Neutral — no axis bias
+    1: 1,      # Anger → anger axis
+    2: 0,      # Fear → fear axis
+    3: 6,      # Happy → joy axis
+    4: 5,      # Sad → sadness axis
+    5: 4,      # Surprised → excitement axis
+    6: 8,      # Puzzled → residual axis
+    7: 3,      # Disgusted → disgust axis
+}
 
 
 # ---------------------------------------------------------------------------

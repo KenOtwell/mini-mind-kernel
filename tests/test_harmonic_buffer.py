@@ -6,14 +6,15 @@ import pytest
 
 from shared.constants import EMOTIONAL_DIM, ZERO_SEMAGRAM
 from mindcore.harmonic_buffer import (
-    DynamicModulators,
+    AxisModulators,
+    DynamicModulators,  # compat alias
     EmotionalDelta,
     HarmonicBuffer,
     HarmonicConfig,
     HarmonicState,
-    build_modulators,
     configure,
 )
+from progeny.src.modulators import build_modulators
 
 
 @pytest.fixture(autouse=True)
@@ -295,28 +296,26 @@ class TestEmotionalMomentum:
 # ---------------------------------------------------------------------------
 
 class TestBuildModulators:
-    """Test the build_modulators() constructor from raw engine values."""
+    """Test build_modulators() — NPC preset-to-physics translation (progeny layer)."""
 
     def test_default_values(self):
         mods = build_modulators()
-        assert mods.aggression_gain == 0.0
-        assert mods.confidence_damp == pytest.approx(0.5)  # default confidence=2 / 4
-        assert mods.morality_threshold == 3
+        assert mods.reactivity_gain == 0.0
+        assert mods.fear_dampening == pytest.approx(0.5)  # default confidence=2 / 4
         assert mods.mood_axis is None  # Neutral
         assert mods.mood_pull == 0.0
-        assert mods.assistance_coupling == 0.0
 
     def test_frenzied_aggression(self):
         mods = build_modulators(aggression=3)
-        assert mods.aggression_gain == pytest.approx(1.0)
+        assert mods.reactivity_gain == pytest.approx(1.0)
 
     def test_foolhardy_confidence(self):
         mods = build_modulators(confidence=4)
-        assert mods.confidence_damp == pytest.approx(1.0)
+        assert mods.fear_dampening == pytest.approx(1.0)
 
     def test_cowardly_confidence(self):
         mods = build_modulators(confidence=0)
-        assert mods.confidence_damp == 0.0
+        assert mods.fear_dampening == 0.0
 
     def test_happy_mood_maps_to_joy_axis(self):
         mods = build_modulators(mood=3)
@@ -332,16 +331,11 @@ class TestBuildModulators:
         assert mods.mood_axis is None
         assert mods.mood_pull == 0.0
 
-    def test_full_assistance(self):
-        mods = build_modulators(assistance=2)
-        assert mods.assistance_coupling == pytest.approx(1.0)
-
     def test_clamping_out_of_range(self):
         """Out-of-range inputs get clamped to [0, 1]."""
-        mods = build_modulators(aggression=10, confidence=10, assistance=10)
-        assert mods.aggression_gain <= 1.0
-        assert mods.confidence_damp <= 1.0
-        assert mods.assistance_coupling <= 1.0
+        mods = build_modulators(aggression=10, confidence=10)
+        assert mods.reactivity_gain <= 1.0
+        assert mods.fear_dampening <= 1.0
 
 
 class TestDynamicModulators:
@@ -470,7 +464,7 @@ class TestDynamicModulators:
         state.apply_modulators("Lydia", mods)
         buf = state._buffers["Lydia"]
         assert buf._modulators is not None
-        assert buf._modulators.aggression_gain == pytest.approx(1.0)
+        assert buf._modulators.reactivity_gain == pytest.approx(1.0)
         assert buf._modulators.mood_axis == 6
 
     def test_joker_profile_emergent_behavior(self):

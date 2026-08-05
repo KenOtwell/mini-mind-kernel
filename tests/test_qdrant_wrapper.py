@@ -47,7 +47,7 @@ class TestIngest:
             text="I am sworn to carry your burdens.",
             collection=COLLECTION_NPC_MEMORIES,
             agent_id="Lydia",
-            game_ts=100.0,
+            session_ts=100.0,
         )
         assert key is not None
         assert isinstance(key, str)
@@ -61,7 +61,7 @@ class TestIngest:
             text="Something's not right. Stay behind me.",
             collection=COLLECTION_NPC_MEMORIES,
             agent_id="Lydia",
-            game_ts=100.0,
+            session_ts=100.0,
             event_type="speech",
         )
         mock_client.upsert.assert_called_once()
@@ -83,7 +83,7 @@ class TestIngest:
             text="Do come back.",
             collection=COLLECTION_NPC_MEMORIES,
             agent_id="Belethor",
-            game_ts=200.0,
+            session_ts=200.0,
             event_type="dialogue",
             extra_payload={"location": "Whiterun"},
         )
@@ -92,7 +92,7 @@ class TestIngest:
         assert payload["text"] == "Do come back."
         assert payload["agent_id"] == "Belethor"
         assert payload["event_type"] == "dialogue"
-        assert payload["game_ts"] == 200.0
+        assert payload["session_ts"] == 200.0
         assert payload["location"] == "Whiterun"
         assert "wall_ts" in payload
 
@@ -105,7 +105,7 @@ class TestIngest:
                 text=text or "",
                 collection=COLLECTION_NPC_MEMORIES,
                 agent_id="Nobody",
-                game_ts=0.0,
+                session_ts=0.0,
             )
             assert key is None
         mock_client.upsert.assert_not_called()
@@ -119,7 +119,7 @@ class TestIngest:
             text="This should fail gracefully.",
             collection=COLLECTION_NPC_MEMORIES,
             agent_id="Test",
-            game_ts=0.0,
+            session_ts=0.0,
         )
         assert key is None
 
@@ -131,7 +131,7 @@ class TestIngest:
             text="I'm terrified of that dragon!",
             collection=COLLECTION_NPC_MEMORIES,
             agent_id="Guard",
-            game_ts=50.0,
+            session_ts=50.0,
         )
         point = mock_client.upsert.call_args.kwargs["points"][0]
         emotional_vec = point.vector["emotional"]

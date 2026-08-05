@@ -309,7 +309,8 @@ class MemoryWriter:
         semantic_vector: list[float],
         emotional_vector: list[float],
         raw_point_ids: list[str],
-        game_ts: float,
+        session_ts: float = 0.0,
+        game_ts: Optional[float] = None,  # deprecated alias for session_ts
         *,
         referents: Optional[list[str]] = None,
         slow_snapshot: Optional[list[float]] = None,
@@ -357,12 +358,14 @@ class MemoryWriter:
         Returns the RECON point ID.
         """
         point_id = point_id or str(uuid4())
+        if game_ts is not None:
+            session_ts = game_ts  # backward compat alias
         payload: dict[str, Any] = {
             "agent_id": agent_id,
             "tier": CompressionTier.RECON.value,
             "content": gist_text,
             "event_type": "reconsolidated_summary",
-            "game_ts": game_ts,
+            "game_ts": session_ts,  # field kept as game_ts for Qdrant backward compat
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "raw_point_ids": raw_point_ids,
             "referents": referents or [],

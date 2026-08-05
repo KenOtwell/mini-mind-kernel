@@ -39,7 +39,8 @@ from progeny.src.llm_client import GenerateResult, LLMError
 from progeny.src import response_expander
 from progeny.src.memory_compressor import slide_window
 from progeny.src import emotional_delta
-from mindcore.harmonic_buffer import HarmonicState, build_modulators
+from mindcore.harmonic_buffer import HarmonicState
+from progeny.src.modulators import build_modulators
 from progeny.src.memory_writer import MemoryWriter
 from progeny.src.memory_retrieval import MemoryRetriever, MemoryBundle
 from progeny.src.compression import ArcCompressor, SceneCompressor
@@ -805,8 +806,8 @@ def _apply_modulators_for_new_npcs(turn_context: TurnContext) -> None:
                 _harmonic_state.apply_modulators(agent_id, mods)
                 _event_log.log_modulators(agent_id, actor_values)
                 logger.info(
-                    "Applied modulators for %s: agg=%.2f conf=%.2f mood=%s",
-                    agent_id, mods.aggression_gain, mods.confidence_damp,
+                    "Applied modulators for %s: reactivity=%.2f fear_damp=%.2f mood=%s",
+                    agent_id, mods.reactivity_gain, mods.fear_dampening,
                     mods.mood_axis,
                 )
                 break  # One addnpc per agent is enough

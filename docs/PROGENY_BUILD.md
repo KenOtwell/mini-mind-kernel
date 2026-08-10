@@ -101,7 +101,7 @@ Tests at this point: send a TickPackage with an inputtext event and active NPCs,
 
 ### Phase 2: Emotional Intelligence
 8. **`embedding.py`** — Load all-MiniLM-L6-v2 on CPU. Batch embed. Cache layer.
-9. **`emotional_delta.py`** — embed → project onto 9d bases (load from shared/data/emotional_bases_9d.npz) → compute delta → curvature → snap. Bidirectional: both incoming events AND outgoing LLM text.
+9. **`emotional_delta.py`** — embed → project onto 9d bases (loaded via `mindcore.emotional`, backed by `mindcore/mindcore/data/emotional_bases_9d.npz`) → compute delta → curvature → snap. Bidirectional: both incoming events AND outgoing LLM text.
 10. **`harmonic_buffer.py`** — Per-agent 3×9d EMA traces. Curvature, snap, λ(t), cross-buffer coherence. Zero-init pattern.
 11. **`client.py`** — Qdrant REST wrapper. Connect to GamingPC:6333 over LAN. Dual-vector upsert/search. Health check.
 12. **`memory_retrieval.py`** — Start with semantic-only search. Add emotional axis + RRF fusion. Then referent filtering, recency decay, anchor boosting.
@@ -126,7 +126,7 @@ Before building, read these (in order):
 7. `falcon/src/tick_accumulator.py` — understand what Falcon ships to you
 8. `falcon/api/routes.py` — understand the full Falcon pipeline and how it calls you
 9. `scripts/stub_progeny.py` — the stub you're replacing. Shows the minimal contract.
-10. `shared/data/emotional_bases_9d.npz` — the 9d emotional projection bases
+10. `mindcore/mindcore/data/emotional_bases_9d.npz` — the 9d emotional projection bases (single source of truth, owned by mindcore; regenerate via `mindcore/scripts/build_emotional_bases.py`)
 
 ## Existing Test Infrastructure
 

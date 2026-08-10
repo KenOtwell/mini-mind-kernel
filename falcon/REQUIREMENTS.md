@@ -254,7 +254,7 @@ From `shared/`:
 - `schemas.py` — `EventPayload`, `TurnResponse`, `AckResponse`, `EmotionalState`, `MemoryContext`, `ActionCommand`, `ActorValueDeltas` type definitions
 - `config.py` — Qdrant host/port, Progeny host/port, embedding model path, distance thresholds, decay parameters
 - `constants.py` — 9d axis names, privacy levels, event type enums, actor value ranges, command vocabulary (43 commands)
-- `data/emotional_bases_9d.npz` — orthogonal basis vectors for 9d projection
+- (formerly `data/emotional_bases_9d.npz`, now owned by mindcore) — orthogonal basis vectors for 9d projection live at `mindcore/mindcore/data/emotional_bases_9d.npz`, regenerated via `mindcore/scripts/build_emotional_bases.py`
 
 ## Constraints
 
